@@ -1,0 +1,21 @@
+{
+  "name": "testtest",
+  "version": "1.0.0",
+  "description": "Logs every HTTP request and exposes them as HTML and JSON",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.1.0",
+    "sqlite3": "^5.1.7",
+    "ws": "^8.18.3"
+  }
+}
