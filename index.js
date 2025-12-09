@@ -19,68 +19,41 @@ const path = require('path');
 const os = require('os');
 const sqlite3 = require('sqlite3').verbose();
 const WebSocket = require('ws');
-const session = require('express-session');
 
 const app = express();
 const server = http.createServer(app);
 const port = process.env.PORT || 3000;
 
-// Generate random UUID for login path (changes every 5 minutes)
+// Generate random UUID for logger path (changes every 5 minutes)
 const crypto = require('crypto');
-let LOGIN_UUID = crypto.randomUUID();
-let LOGIN_PATH = `/${LOGIN_UUID}/login`;
+let LOGGER_UUID = crypto.randomUUID();
+let LOGGER_PATH = `/${LOGGER_UUID}/logger`;
 
 // Function to regenerate UUID and update path
-function regenerateLoginUUID() {
-  LOGIN_UUID = crypto.randomUUID();
-  LOGIN_PATH = `/${LOGIN_UUID}/login`;
-  console.log('Login UUID regenerated:', LOGIN_UUID);
-  return LOGIN_UUID;
+function regenerateLoggerUUID() {
+  LOGGER_UUID = crypto.randomUUID();
+  LOGGER_PATH = `/${LOGGER_UUID}/logger`;
+  console.log('Logger UUID regenerated:', LOGGER_UUID);
+  return LOGGER_UUID;
 }
 
 // Regenerate UUID every 5 minutes (300000 ms)
 const UUID_REGEN_INTERVAL = process.env.UUID_REGEN_INTERVAL || 300000; // 5 minutes default
 setInterval(() => {
-  regenerateLoginUUID();
+  regenerateLoggerUUID();
 }, UUID_REGEN_INTERVAL);
 
 // JSON parsing for any future needs
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // For form data
 
-// Session configuration
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'testtest-secret-key-change-in-production',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: false, // Set to true if using HTTPS
-    httpOnly: true,
-    maxAge: 24 * 60 * 60 * 1000 // 24 hours
-  }
-}));
-
-// Authentication credentials (use environment variables in production)
-const AUTH_USERNAME = process.env.AUTH_USERNAME || 'admin';
-const AUTH_PASSWORD = process.env.AUTH_PASSWORD || 'password';
-
-// Authentication middleware
-function requireAuth(req, res, next) {
-  if (req.session && req.session.authenticated) {
-    return next();
-  }
-  // Get current LOGIN_PATH at request time (in case it changed)
-  const currentLoginPath = `/${LOGIN_UUID}/login`;
-  res.redirect(currentLoginPath);
-}
-
-// Route to regenerate UUID manually (requires authentication)
-app.post('/regenerate-uuid', requireAuth, (req, res) => {
-  const newUUID = regenerateLoginUUID();
+// Route to regenerate UUID manually
+app.post('/regenerate-uuid', (req, res) => {
+  const newUUID = regenerateLoggerUUID();
   res.json({ 
     success: true, 
     uuid: newUUID, 
-    loginPath: LOGIN_PATH,
+    loggerPath: LOGGER_PATH,
     message: 'UUID regenerated successfully'
   });
 });
@@ -565,186 +538,277 @@ function getFingerprintingScript() {
 `;
 }
 
-// Login page with UUID path (dynamic route handler)
-app.get('/:uuid/login', (req, res) => {
-  // Check if the UUID matches the current one
-  if (req.params.uuid !== LOGIN_UUID) {
-    return res.redirect(`/${LOGIN_UUID}/login`);
-  }
-  
-  if (req.session && req.session.authenticated) {
-    return res.redirect('/');
-  }
-  
-  const fingerprintScript = getFingerprintingScript();
-  
+// Root page - just shows the UUID
+app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="robots" content="noindex, nofollow">
-  <title>Login - HTTP Request Logger</title>
+  <title>HTTP Request Logger - UUID</title>
   <style>
     body {
       background-color: #1a1a1a;
       color: #e0e0e0;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       margin: 0;
-      padding: 0;
+      padding: 20px;
       display: flex;
       justify-content: center;
       align-items: center;
       min-height: 100vh;
     }
-    .login-container {
+    .container {
+      text-align: center;
+      padding: 40px;
       background-color: #2d2d2d;
       border: 1px solid #555;
       border-radius: 8px;
-      padding: 40px;
-      box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-      width: 100%;
-      max-width: 400px;
+      max-width: 600px;
+    }
+    h1 {
+      color: #ffffff;
+      margin-bottom: 30px;
+    }
+    .uuid-display {
+      background-color: #3d3d3d;
+      border: 1px solid #666;
+      border-radius: 4px;
+      padding: 20px;
+      margin: 20px 0;
+      word-break: break-all;
+    }
+    .uuid-value {
+      color: #4a90e2;
+      font-family: monospace;
+      font-size: 18px;
+      font-weight: bold;
+      margin: 10px 0;
+    }
+    .logger-link {
+      display: inline-block;
+      background-color: #007bff;
+      color: white;
+      padding: 12px 24px;
+      text-decoration: none;
+      border-radius: 6px;
+      margin-top: 20px;
+      transition: background-color 0.3s;
+    }
+    .logger-link:hover {
+      background-color: #0056b3;
+    }
+    button {
+      margin-top: 10px;
+      background-color: #f39c12;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      padding: 8px 16px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background-color 0.3s;
+    }
+    button:hover {
+      background-color: #e67e22;
+    }
+    button:disabled {
+      background-color: #95a5a6;
+      cursor: not-allowed;
+    }
+    #uuidStatus {
+      margin-top: 8px;
+      font-size: 12px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🌐 HTTP Request Logger</h1>
+    <div class="uuid-display">
+      <p style="margin: 0; color: #b0b0b0; font-size: 14px;">Logger UUID:</p>
+      <p class="uuid-value" id="loggerUuid">${LOGGER_UUID}</p>
+      <p style="margin: 10px 0 0 0; color: #95a5a6; font-size: 12px;">
+        Logger URL: <code style="background: #2d2d2d; padding: 2px 6px; border-radius: 3px;">${req.protocol}://${req.get('host')}${LOGGER_PATH}</code>
+      </p>
+    </div>
+    <a href="${LOGGER_PATH}" class="logger-link">🔍 Go to Logger</a>
+    <div style="margin-top: 20px;">
+      <button id="regenerateUuidBtn">🔄 Regenerate UUID</button>
+      <div id="uuidStatus"></div>
+    </div>
+  </div>
+  
+  <script>
+    window.addEventListener('load', function() {
+      const regenerateBtn = document.getElementById('regenerateUuidBtn');
+      if (!regenerateBtn) return;
+      
+      regenerateBtn.addEventListener('click', async function() {
+        const btn = this;
+        const statusDiv = document.getElementById('uuidStatus');
+        const loggerUuidEl = document.getElementById('loggerUuid');
+        
+        btn.disabled = true;
+        btn.textContent = '⏳ Regenerating...';
+        
+        try {
+          const response = await fetch('/regenerate-uuid', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            }
+          });
+          
+          const data = await response.json();
+          
+          if (data.success) {
+            loggerUuidEl.textContent = data.uuid;
+            // Update the logger link URL
+            const loggerLink = document.querySelector('.logger-link');
+            if (loggerLink) {
+              loggerLink.href = data.loggerPath;
+            }
+            // Update the logger URL display if it exists
+            const loggerUrlEl = document.querySelector('code');
+            if (loggerUrlEl && loggerUrlEl.textContent.includes('logger')) {
+              loggerUrlEl.textContent = window.location.protocol + '//' + window.location.host + data.loggerPath;
+            }
+            statusDiv.textContent = '✓ UUID regenerated successfully!';
+            statusDiv.style.color = '#28a745';
+            statusDiv.style.display = 'block';
+            
+            setTimeout(() => {
+              statusDiv.style.display = 'none';
+            }, 3000);
+          } else {
+            throw new Error(data.message || 'Failed to regenerate UUID');
+          }
+        } catch (error) {
+          statusDiv.textContent = '✗ Error: ' + error.message;
+          statusDiv.style.color = '#e74c3c';
+          statusDiv.style.display = 'block';
+          
+          setTimeout(() => {
+            statusDiv.style.display = 'none';
+          }, 3000);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '🔄 Regenerate UUID';
+        }
+      });
+    });
+  </script>
+</body>
+</html>`);
+});
+
+// Logger page with UUID path (dynamic route handler)
+app.get('/:uuid/logger', (req, res) => {
+  // Check if the UUID matches the current one
+  if (req.params.uuid !== LOGGER_UUID) {
+    return res.redirect(`/${LOGGER_UUID}/logger`);
+  }
+  
+  db.all(`SELECT method,url,headers,body,timestamp FROM logs ORDER BY id DESC`, (err, rows) => {
+    if (err) return res.status(500).send('Error reading logs');
+
+    const entriesHtml = rows.map(r => `
+      <div class="log-entry">
+        <h2>[${r.timestamp}] ${r.method} ${r.url}</h2>
+        <h3>Headers:</h3>
+        <pre>${JSON.stringify(JSON.parse(r.headers||'{}'),null,2)}</pre>
+        ${r.body ? `<h3>Body:</h3><pre>${JSON.stringify(JSON.parse(r.body),null,2)}</pre>` : ''}
+      </div>
+    `).join('');
+
+    const fingerprintScript = getFingerprintingScript();
+
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex, nofollow">
+  <title>HTTP Request Logger</title>
+  <style>
+    body {
+      background-color: #1a1a1a;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0;
+      padding: 20px;
     }
     h1 {
       color: #ffffff;
       text-align: center;
       margin-bottom: 30px;
     }
-    .form-group {
-      margin-bottom: 20px;
-    }
-    label {
-      display: block;
-      color: #e0e0e0;
-      margin-bottom: 8px;
-      font-size: 14px;
-    }
-    input[type="text"],
-    input[type="password"] {
-      width: 100%;
-      padding: 12px;
-      background-color: #3d3d3d;
+    .log-entry {
+      background-color: #2d2d2d;
       border: 1px solid #555;
-      border-radius: 4px;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    }
+    .log-entry h2 {
+      color: #4a90e2;
+      margin-top: 0;
+      margin-bottom: 15px;
+      font-size: 18px;
+    }
+    .log-entry h3 {
       color: #e0e0e0;
+      margin-bottom: 10px;
       font-size: 14px;
-      box-sizing: border-box;
     }
-    input[type="text"]:focus,
-    input[type="password"]:focus {
-      outline: none;
-      border-color: #4a90e2;
+    pre {
+      background-color: #3d3d3d;
+      border: 1px solid #666;
+      border-radius: 4px;
+      padding: 15px;
+      color: #b0b0b0;
+      font-size: 12px;
+      overflow-x: auto;
+      white-space: pre-wrap;
     }
-    .login-button {
-      width: 100%;
-      padding: 12px;
+    .nav-link {
+      display: inline-block;
       background-color: #007bff;
       color: white;
-      border: none;
-      border-radius: 4px;
-      font-size: 16px;
-      font-weight: bold;
-      cursor: pointer;
+      padding: 10px 20px;
+      text-decoration: none;
+      border-radius: 6px;
+      margin: 10px 5px;
       transition: background-color 0.3s;
     }
-    .login-button:hover {
+    .nav-link:hover {
       background-color: #0056b3;
-    }
-    .error-message {
-      color: #e74c3c;
-      text-align: center;
-      margin-top: 15px;
-      font-size: 14px;
-      display: none;
-    }
-    .error-message.show {
-      display: block;
     }
   </style>
 </head>
 <body>
-  <div class="login-container">
-    <h1>🔐 Login</h1>
-    <div style="text-align: center; margin-bottom: 20px; padding: 10px; background-color: #3d3d3d; border-radius: 4px;">
-      <p style="margin: 0; color: #b0b0b0; font-size: 12px;">Login UUID:</p>
-      <p style="margin: 5px 0 0 0; color: #4a90e2; font-family: monospace; font-size: 14px; word-break: break-all;">
-        <code style="background: #2d2d2d; padding: 4px 8px; border-radius: 3px;">${LOGIN_UUID}</code>
-      </p>
-    </div>
-    <form id="loginForm" method="POST" action="/${LOGIN_UUID}/login">
-      <div class="form-group">
-        <label for="username">Username:</label>
-        <input type="text" id="username" name="username" required autofocus>
-      </div>
-      <div class="form-group">
-        <label for="password">Password:</label>
-        <input type="password" id="password" name="password" required>
-      </div>
-      <button type="submit" class="login-button">Login</button>
-      <div id="errorMessage" class="error-message"></div>
-    </form>
+  <h1>🌐 HTTP Request Logger</h1>
+  
+  <div style="text-align: center; margin-bottom: 30px;">
+    <a href="/objects" class="nav-link">🔍 Browser Objects Explorer</a>
+    <a href="/logs" class="nav-link">📋 View Logs API</a>
   </div>
-  <script>
-    const form = document.getElementById('loginForm');
-    const errorMessage = document.getElementById('errorMessage');
-    const urlParams = new URLSearchParams(window.location.search);
-    
-    if (urlParams.get('error') === '1') {
-      errorMessage.textContent = 'Invalid username or password';
-      errorMessage.classList.add('show');
-    } else if (urlParams.get('error') === 'expired') {
-      errorMessage.textContent = 'Login URL has expired. Please refresh the page for a new login URL.';
-      errorMessage.classList.add('show');
-    }
-    
-    form.addEventListener('submit', function(e) {
-      const username = document.getElementById('username').value;
-      const password = document.getElementById('password').value;
-      
-      if (!username || !password) {
-        e.preventDefault();
-        errorMessage.textContent = 'Please enter both username and password';
-        errorMessage.classList.add('show');
-        return false;
-      }
-    });
-  </script>
+  
+  <div class="log-entries">
+    ${entriesHtml}
+  </div>
+  
   ${fingerprintScript}
 </body>
 </html>`);
-});
-
-// Login POST handler (dynamic route)
-app.post('/:uuid/login', (req, res) => {
-  // Check if the UUID matches the current one
-  if (req.params.uuid !== LOGIN_UUID) {
-    return res.redirect(`/${LOGIN_UUID}/login?error=expired`);
-  }
-  
-  const { username, password } = req.body;
-  
-  if (username === AUTH_USERNAME && password === AUTH_PASSWORD) {
-    req.session.authenticated = true;
-    req.session.username = username;
-    res.redirect('/');
-  } else {
-    res.redirect(`/${LOGIN_UUID}/login?error=1`);
-  }
-});
-
-// Logout handler
-app.get('/logout', (req, res) => {
-  req.session.destroy((err) => {
-    if (err) {
-      return res.redirect('/');
-    }
-    // Use current UUID at logout time
-    res.redirect(`/${LOGIN_UUID}/login`);
   });
 });
 
-// Content negotiation on '/logs' (requires authentication)
-app.get('/logs', requireAuth, (req, res) => {
+
+// Content negotiation on '/logs'
+app.get('/logs', (req, res) => {
   db.all(`SELECT method,url,headers,body,timestamp FROM logs ORDER BY id DESC`, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
 
@@ -1255,603 +1319,6 @@ ${script}
   });
 });
 
-// HTML view at '/' with fingerprinting script (requires authentication)
-app.get('/', requireAuth, (req, res) => {
-  db.all(`SELECT method,url,headers,body,timestamp FROM logs ORDER BY id DESC`, (err, rows) => {
-    if (err) return res.status(500).send('Error reading logs');
-
-    const entriesHtml = rows.map(r => `
-      <div class="log-entry">
-        <h2>[${r.timestamp}] ${r.method} ${r.url}</h2>
-        <h3>Headers:</h3>
-        <pre>${JSON.stringify(JSON.parse(r.headers||'{}'),null,2)}</pre>
-        ${r.body ? `<h3>Body:</h3><pre>${JSON.stringify(JSON.parse(r.body),null,2)}</pre>` : ''}
-      </div>
-    `).join('');
-
-    const script = `
-<script>
-(function(){
-  function getCanvasFingerprint(){
-    const canvas=document.createElement('canvas');
-    const ctx=canvas.getContext('2d');
-    ctx.textBaseline='top';ctx.font='16px Arial';
-    ctx.fillStyle='#f60';ctx.fillRect(125,1,62,20);
-    ctx.fillStyle='#069';ctx.fillText('FPJS',2,15);
-    ctx.fillStyle='rgba(102,204,0,0.7)';ctx.fillText('FPJS',4,17);
-    return canvas.toDataURL();
-  }
-  
-  function parseCookies(cookieString) {
-    if (!cookieString) return {};
-    const cookies = {};
-    cookieString.split(';').forEach(cookie => {
-      const [name, value] = cookie.trim().split('=');
-      if (name && value) {
-        cookies[name] = decodeURIComponent(value);
-      }
-    });
-    return cookies;
-  }
-  
-  // SharedWorker fingerprinting with Blob-based approach
-  let sharedWorkerFingerprint = {};
-  try {
-    // Check for SharedWorker support with proper constructor validation
-    const Wkr = window.frameElement ? window.frameElement.SharedWorker : SharedWorker;
-    if (!Wkr || Wkr.prototype.constructor.name !== "SharedWorker") {
-      sharedWorkerFingerprint = { 
-        supported: false, 
-        error: 'SharedWorker not available or invalid constructor' 
-      };
-    } else {
-      // Create fingerprinting JavaScript for the worker
-      const fingerprintingJS = \`
-        self.onconnect = function(e) {
-          const port = e.ports[0];
-          port.start();
-          
-          // Comprehensive fingerprinting from within the worker context
-          function collectFingerprint() {
-            try {
-              const fp = {
-                // Worker context information
-                workerContext: {
-                  type: 'SharedWorker',
-                  constructor: self.constructor.name,
-                  prototype: self.constructor.prototype ? Object.getOwnPropertyNames(self.constructor.prototype).length : 0,
-                  maxWorkers: navigator.hardwareConcurrency || 'unknown',
-                  userAgent: navigator.userAgent,
-                  platform: navigator.platform,
-                  languages: navigator.languages,
-                  language: navigator.language,
-                  cookieEnabled: navigator.cookieEnabled,
-                  onLine: navigator.onLine,
-                  doNotTrack: navigator.doNotTrack,
-                  maxTouchPoints: navigator.maxTouchPoints || 'unknown',
-                  msMaxTouchPoints: navigator.msMaxTouchPoints || 'unknown'
-                },
-                
-                // Enhanced User-Agent and Platform data
-                userAgentData: navigator.userAgentData ? {
-                  brands: navigator.userAgentData.brands,
-                  mobile: navigator.userAgentData.mobile,
-                  platform: navigator.userAgentData.platform,
-                  architecture: navigator.userAgentData.architecture,
-                  bitness: navigator.userAgentData.bitness,
-                  model: navigator.userAgentData.model,
-                  platformVersion: navigator.userAgentData.platformVersion,
-                  fullVersionList: navigator.userAgentData.fullVersionList,
-                  wow64: navigator.userAgentData.wow64
-                } : 'unsupported',
-                
-                // Additional platform and system information
-                platformDetails: {
-                  platform: navigator.platform,
-                  vendor: navigator.vendor,
-                  product: navigator.product,
-                  productSub: navigator.productSub,
-                  appName: navigator.appName,
-                  appVersion: navigator.appVersion,
-                  appCodeName: navigator.appCodeName
-                },
-                
-                // Enhanced language and locale information
-                localeInfo: {
-                  languages: navigator.languages,
-                  language: navigator.language,
-                  hasLanguages: Array.isArray(navigator.languages),
-                  languageCount: navigator.languages ? navigator.languages.length : 0,
-                  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-                  timezoneOffset: new Date().getTimezoneOffset(),
-                  dateFormat: new Intl.DateTimeFormat().formatToParts(new Date()).map(p => p.type),
-                  numberFormat: new Intl.NumberFormat().resolvedOptions(),
-                  collator: new Intl.Collator().resolvedOptions()
-                },
-                
-                // Hardware and performance information
-                hardwareInfo: {
-                  hardwareConcurrency: navigator.hardwareConcurrency || 'unknown',
-                  deviceMemory: navigator.deviceMemory || 'unknown',
-                  connection: navigator.connection ? {
-                    effectiveType: navigator.connection.effectiveType,
-                    downlink: navigator.connection.downlink,
-                    rtt: navigator.connection.rtt
-                  } : 'unsupported'
-                },
-                
-                // Worker-specific capabilities (only worker-available APIs)
-                workerCapabilities: {
-                  sharedWorker: true, // We're already in a SharedWorker
-                  worker: typeof Worker !== 'undefined',
-                  serviceWorker: 'serviceWorker' in navigator,
-                  worklet: false, // CSS not available in workers
-                  offscreenCanvas: typeof OffscreenCanvas !== 'undefined'
-                },
-                
-                // Media capabilities (only worker-available APIs)
-                mediaCapabilities: {
-                  mediaSession: 'mediaSession' in navigator,
-                  mediaDevices: 'mediaDevices' in navigator,
-                  permissions: 'permissions' in navigator,
-                  credentials: 'credentials' in navigator,
-                  storage: 'storage' in navigator,
-                  presentation: 'presentation' in navigator,
-                  wakeLock: 'wakeLock' in navigator,
-                  usb: 'usb' in navigator,
-                  bluetooth: 'bluetooth' in navigator,
-                  hid: 'hid' in navigator,
-                  serial: 'serial' in navigator
-                },
-                
-                // Performance information
-                performanceInfo: {
-                  memory: performance.memory ? {
-                    usedJSHeapSize: performance.memory.usedJSHeapSize,
-                    totalJSHeapSize: performance.memory.totalJSHeapSize,
-                    jsHeapSizeLimit: performance.memory.jsHeapSizeLimit
-                  } : 'unsupported',
-                  timing: performance.timing ? {
-                    navigationStart: performance.timing.navigationStart,
-                    loadEventEnd: performance.timing.loadEventEnd,
-                    domContentLoadedEventEnd: performance.timing.domContentLoadedEventEnd
-                  } : 'unsupported',
-                  navigation: performance.navigation ? {
-                    type: performance.navigation.type,
-                    redirectCount: performance.navigation.redirectCount
-                  } : 'unsupported'
-                },
-                
-                // Canvas fingerprinting (simplified for worker)
-                canvas: 'offscreen_supported'
-              };
-              
-              return fp;
-            } catch (e) {
-              return { error: 'Worker fingerprinting failed: ' + e.message };
-            }
-          }
-          
-          // Collect and send fingerprint immediately
-          try {
-            const fp = collectFingerprint();
-            port.postMessage({ type: 'fingerprint', data: fp });
-          } catch (error) {
-            port.postMessage({ type: 'error', error: error.message });
-          }
-        };
-      \`;
-      
-      // Create Blob-based SharedWorker
-      const worker = new Wkr(
-        URL.createObjectURL(
-          new Blob([fingerprintingJS], { type: "application/javascript" })
-        )
-      );
-      
-      sharedWorkerFingerprint = {
-        supported: true,
-        constructor: Wkr.name,
-        prototype: Wkr.prototype ? Object.getOwnPropertyNames(Wkr.prototype).length : 0,
-        maxWorkers: navigator.hardwareConcurrency || 'unknown'
-      };
-      
-      // Handle messages from the worker
-      worker.port.onmessage = function(e) {
-        if (e.data.type === 'fingerprint') {
-          sharedWorkerFingerprint.working = true;
-          sharedWorkerFingerprint.workerData = e.data.data;
-          console.log('SharedWorker fingerprint collected:', e.data.data);
-        } else if (e.data.type === 'error') {
-          sharedWorkerFingerprint.error = e.data.error;
-          console.error('SharedWorker error:', e.data.error);
-        }
-      };
-      
-      // Handle worker errors
-      worker.port.onerror = function(e) {
-        sharedWorkerFingerprint.error = 'Port error: ' + e.message;
-        console.error('SharedWorker port error:', e);
-      };
-      
-      worker.port.start();
-      
-      // Set a timeout to mark as failed if no response
-      setTimeout(() => {
-        if (!sharedWorkerFingerprint.working && !sharedWorkerFingerprint.error) {
-          sharedWorkerFingerprint.error = 'Timeout: No response from worker';
-          console.warn('SharedWorker timeout - no response received');
-        }
-      }, 5000);
-      
-      // Clean up the blob URL when done
-      setTimeout(() => {
-        URL.revokeObjectURL(worker.port.url);
-      }, 10000);
-    }
-  } catch (e) {
-    sharedWorkerFingerprint = { supported: false, error: e.message };
-  }
-  
-  const fp = {
-    origin: location.pathname,
-    userAgent: navigator.userAgent,
-    platform: navigator.platform,
-    languages: navigator.languages,
-    screen: { width: screen.width, height: screen.height, colorDepth: screen.colorDepth },
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    webdriver: navigator.webdriver||false,
-    hasLanguages: Array.isArray(navigator.languages),
-    pluginsCount: navigator.plugins.length,
-    headlessUA: /HeadlessChrome/.test(navigator.userAgent),
-    canvas: getCanvasFingerprint(),
-    cookies: parseCookies(document.cookie),
-    rawCookies: document.cookie,
-    sharedWorker: sharedWorkerFingerprint,
-    // Additional SharedWorker-related properties
-    workerSupport: {
-      sharedWorker: typeof SharedWorker !== 'undefined',
-      worker: typeof Worker !== 'undefined',
-      serviceWorker: 'serviceWorker' in navigator,
-      worklet: 'worklet' in CSS
-    },
-    hardwareConcurrency: navigator.hardwareConcurrency || 'unknown',
-    deviceMemory: navigator.deviceMemory || 'unknown',
-    connection: navigator.connection ? {
-      effectiveType: navigator.connection.effectiveType,
-      downlink: navigator.connection.downlink,
-      rtt: navigator.connection.rtt
-    } : 'unsupported',
-    // Enhanced User-Agent and Platform data
-    userAgentData: navigator.userAgentData ? {
-      brands: navigator.userAgentData.brands,
-      mobile: navigator.userAgentData.mobile,
-      platform: navigator.userAgentData.platform,
-      architecture: navigator.userAgentData.architecture,
-      bitness: navigator.userAgentData.bitness,
-      model: navigator.userAgentData.model,
-      platformVersion: navigator.userAgentData.platformVersion,
-      fullVersionList: navigator.userAgentData.fullVersionList,
-      wow64: navigator.userAgentData.wow64
-    } : 'unsupported',
-    // Additional platform and system information
-    platformDetails: {
-      platform: navigator.platform,
-      vendor: navigator.vendor,
-      product: navigator.product,
-      productSub: navigator.productSub,
-      appName: navigator.appName,
-      appVersion: navigator.appVersion,
-      appCodeName: navigator.appCodeName,
-      cookieEnabled: navigator.cookieEnabled,
-      onLine: navigator.onLine,
-      doNotTrack: navigator.doNotTrack,
-      maxTouchPoints: navigator.maxTouchPoints || 'unknown',
-      msMaxTouchPoints: navigator.msMaxTouchPoints || 'unknown'
-    },
-    // Enhanced language and locale information
-    localeInfo: {
-      languages: navigator.languages,
-      language: navigator.language,
-      hasLanguages: Array.isArray(navigator.languages),
-      languageCount: navigator.languages ? navigator.languages.length : 0,
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      timezoneOffset: new Date().getTimezoneOffset(),
-      dateFormat: new Intl.DateTimeFormat().formatToParts(new Date()).map(p => p.type),
-      numberFormat: new Intl.NumberFormat().resolvedOptions(),
-      collator: new Intl.Collator().resolvedOptions()
-    },
-    // Screen and display information
-    displayInfo: {
-      screen: { 
-        width: screen.width, 
-        height: screen.height, 
-        colorDepth: screen.colorDepth,
-        pixelDepth: screen.pixelDepth,
-        availWidth: screen.availWidth,
-        availHeight: screen.availHeight,
-        orientation: screen.orientation ? {
-          type: screen.orientation.type,
-          angle: screen.orientation.angle
-        } : 'unsupported'
-      },
-      window: {
-        innerWidth: window.innerWidth,
-        innerHeight: window.innerHeight,
-        outerWidth: window.outerWidth,
-        outerHeight: window.outerHeight,
-        devicePixelRatio: window.devicePixelRatio,
-        colorGamut: window.matchMedia('(color-gamut: srgb)').matches ? 'srgb' : 
-                    window.matchMedia('(color-gamut: p3)').matches ? 'p3' : 
-                    window.matchMedia('(color-gamut: rec2020)').matches ? 'rec2020' : 'unknown'
-      }
-    },
-    // Media capabilities and codecs
-    mediaCapabilities: {
-      mediaSession: 'mediaSession' in navigator,
-      mediaDevices: 'mediaDevices' in navigator,
-      permissions: 'permissions' in navigator,
-      credentials: 'credentials' in navigator,
-      storage: 'storage' in navigator,
-      presentation: 'presentation' in navigator,
-      wakeLock: 'wakeLock' in navigator,
-      usb: 'usb' in navigator,
-      bluetooth: 'bluetooth' in navigator,
-      hid: 'hid' in navigator,
-      serial: 'serial' in navigator
-    },
-    // Performance and memory information
-    performanceInfo: {
-      memory: performance.memory ? {
-        usedJSHeapSize: performance.memory.usedJSHeapSize,
-        totalJSHeapSize: performance.memory.totalJSHeapSize,
-        jsHeapSizeLimit: performance.memory.jsHeapSizeLimit
-      } : 'unsupported',
-      timing: performance.timing ? {
-        navigationStart: performance.timing.navigationStart,
-        loadEventEnd: performance.timing.loadEventEnd,
-        domContentLoadedEventEnd: performance.timing.domContentLoadedEventEnd
-      } : 'unsupported',
-      navigation: performance.navigation ? {
-        type: performance.navigation.type,
-        redirectCount: performance.navigation.redirectCount
-      } : 'unsupported'
-    },
-    // WebGL and graphics information
-    graphicsInfo: {
-      webgl: (() => {
-        try {
-          const canvas = document.createElement('canvas');
-          const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
-          if (!gl) return 'unsupported';
-          
-          const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
-          return {
-            vendor: debugInfo ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : 'unknown',
-            renderer: debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : 'unknown',
-            version: gl.getParameter(gl.VERSION),
-            shadingLanguageVersion: gl.getParameter(gl.SHADING_LANGUAGE_VERSION),
-            maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
-            maxViewportDims: gl.getParameter(gl.MAX_VIEWPORT_DIMS)
-          };
-        } catch (e) {
-          return 'error: ' + e.message;
-        }
-      })(),
-      webgl2: (() => {
-        try {
-          const canvas = document.createElement('canvas');
-          const gl = canvas.getContext('webgl2');
-          if (!gl) return 'unsupported';
-          
-          return {
-            version: gl.getParameter(gl.VERSION),
-            shadingLanguageVersion: gl.getParameter(gl.SHADING_LANGUAGE_VERSION),
-            maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
-            maxViewportDims: gl.getParameter(gl.MAX_VIEWPORT_DIMS)
-          };
-        } catch (e) {
-          return 'error: ' + e.message;
-        }
-      })()
-    }
-  };
-  
-  // Wait a bit for SharedWorker to respond before sending fingerprint
-  setTimeout(() => {
-    const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host);
-    function detectBrowserDevTools(){
-      let isDevToolsDetected=false;
-      let method='none';
-      
-      // Method 1: Console inspection via Proxy trap
-      const trap=Object.create(new Proxy({}, { ownKeys(){ isDevToolsDetected=true; method='proxy'; } }));
-      try{ console.groupEnd(trap); }catch(_e){}
-      
-      // Method 2: Size-based detection
-      if(!isDevToolsDetected){
-        const widthGap = Math.abs((window.outerWidth || 0) - (window.innerWidth || 0));
-        const heightGap = Math.abs((window.outerHeight || 0) - (window.innerHeight || 0));
-        if(widthGap > 160 || heightGap > 160){
-          isDevToolsDetected=true;
-          method='size';
-        }
-      }
-      
-      // Method 3: Debugger timing
-      if(!isDevToolsDetected){
-        const start = performance.now();
-        try{ debugger; }catch(_e){}
-        if(performance.now() - start > 50){
-          isDevToolsDetected=true;
-          method='timing';
-        }
-      }
-      
-      return { detected: isDevToolsDetected, method: method };
-    }
-    ws.onopen=()=>{
-      try{
-        fp.devtools = detectBrowserDevTools();
-        ws.send(JSON.stringify({type:'fingerprint',data:fp}));
-      }catch(_e){}
-    };
-  }, 1000);
-})();
-</script>
-    `;
-
-    res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="robots" content="noindex, nofollow">
-  <title>HTTP Request Logger</title>
-  <style>
-    body {
-      background-color: #1a1a1a;
-      color: #e0e0e0;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      margin: 0;
-      padding: 20px;
-    }
-    h1 {
-      color: #ffffff;
-      text-align: center;
-      margin-bottom: 30px;
-    }
-    .log-entry {
-      background-color: #2d2d2d;
-      border: 1px solid #555;
-      border-radius: 8px;
-      padding: 20px;
-      margin-bottom: 20px;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.3);
-    }
-    .log-entry h2 {
-      color: #4a90e2;
-      margin-top: 0;
-      margin-bottom: 15px;
-      font-size: 18px;
-    }
-    .log-entry h3 {
-      color: #e0e0e0;
-      margin-bottom: 10px;
-      font-size: 14px;
-    }
-    pre {
-      background-color: #3d3d3d;
-      border: 1px solid #666;
-      border-radius: 4px;
-      padding: 15px;
-      color: #b0b0b0;
-      font-size: 12px;
-      overflow-x: auto;
-      white-space: pre-wrap;
-    }
-    .nav-link {
-      display: inline-block;
-      background-color: #007bff;
-      color: white;
-      padding: 10px 20px;
-      text-decoration: none;
-      border-radius: 6px;
-      margin: 10px 5px;
-      transition: background-color 0.3s;
-    }
-    .nav-link:hover {
-      background-color: #0056b3;
-    }
-  </style>
-</head>
-<body>
-  <div style="text-align: right; margin-bottom: 10px; padding: 10px;">
-    <span style="color: #b0b0b0; margin-right: 15px;">Logged in as: <strong style="color: #4a90e2;">${req.session.username || 'User'}</strong></span>
-    <a href="/logout" style="color: #e74c3c; text-decoration: none; padding: 8px 15px; border: 1px solid #e74c3c; border-radius: 4px; transition: all 0.3s;">Logout</a>
-  </div>
-  
-  <h1>🌐 HTTP Request Logger</h1>
-  
-  <div style="text-align: center; margin-bottom: 20px; padding: 15px; background-color: #2d2d2d; border: 1px solid #555; border-radius: 8px;">
-    <p style="margin: 0; color: #b0b0b0; font-size: 14px;">Login URL:</p>
-    <p style="margin: 5px 0 0 0; color: #4a90e2; font-family: monospace; font-size: 16px; word-break: break-all;">
-      <strong id="loginUrl">${req.protocol}://${req.get('host')}${LOGIN_PATH}</strong>
-    </p>
-    <p style="margin: 10px 0 0 0; color: #95a5a6; font-size: 12px;">UUID: <code id="loginUuid" style="background: #3d3d3d; padding: 2px 6px; border-radius: 3px;">${LOGIN_UUID}</code></p>
-    <button id="regenerateUuidBtn" style="margin-top: 10px; background-color: #f39c12; color: white; border: none; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 14px; transition: background-color 0.3s;">🔄 Regenerate UUID</button>
-    <div id="uuidStatus" style="margin-top: 8px; font-size: 12px; color: #28a745; display: none;"></div>
-  </div>
-  
-  <script>
-    window.addEventListener('load', function() {
-      const regenerateBtn = document.getElementById('regenerateUuidBtn');
-      if (!regenerateBtn) return;
-      
-      regenerateBtn.addEventListener('click', async function() {
-      const btn = this;
-      const statusDiv = document.getElementById('uuidStatus');
-      const loginUrlEl = document.getElementById('loginUrl');
-      const loginUuidEl = document.getElementById('loginUuid');
-      
-      btn.disabled = true;
-      btn.textContent = '⏳ Regenerating...';
-      btn.style.backgroundColor = '#95a5a6';
-      
-      try {
-        const response = await fetch('/regenerate-uuid', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          }
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-          loginUrlEl.textContent = window.location.protocol + '//' + window.location.host + data.loginPath;
-          loginUuidEl.textContent = data.uuid;
-          statusDiv.textContent = '✓ UUID regenerated successfully!';
-          statusDiv.style.color = '#28a745';
-          statusDiv.style.display = 'block';
-          
-          setTimeout(() => {
-            statusDiv.style.display = 'none';
-          }, 3000);
-        } else {
-          throw new Error(data.message || 'Failed to regenerate UUID');
-        }
-      } catch (error) {
-        statusDiv.textContent = '✗ Error: ' + error.message;
-        statusDiv.style.color = '#e74c3c';
-        statusDiv.style.display = 'block';
-        
-        setTimeout(() => {
-          statusDiv.style.display = 'none';
-        }, 3000);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = '🔄 Regenerate UUID';
-        btn.style.backgroundColor = '#f39c12';
-      }
-    });
-    });
-  </script>
-  
-  <div style="text-align: center; margin-bottom: 30px;">
-    <a href="/objects" class="nav-link">🔍 Browser Objects Explorer</a>
-    <a href="/logs" class="nav-link">📋 View Logs API</a>
-  </div>
-  
-  <div class="log-entries">
-    ${entriesHtml}
-  </div>
-  
-  ${script}
-</body>
-</html>`);
-  });
-});
-
 // WebSocket server for fingerprint messages
 const wss = new WebSocket.Server({ server });
 wss.on('connection', ws => {
@@ -1873,7 +1340,7 @@ wss.on('connection', ws => {
 });
 
 // Test iframe page route (requires authentication)
-app.get('/test-iframe', requireAuth, (req, res) => {
+app.get('/test-iframe', (req, res) => {
   const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -1907,7 +1374,7 @@ app.get('/test-iframe', requireAuth, (req, res) => {
 });
 
 // Browser Objects route (requires authentication)
-app.get('/objects', requireAuth, (req, res) => {
+app.get('/objects', (req, res) => {
   const html = `<!DOCTYPE html>
 <html>
   <head>
