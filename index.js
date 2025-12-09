@@ -1328,6 +1328,16 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
+// Route to clear all logs
+app.delete('/clear-logs', (req, res) => {
+  db.run('DELETE FROM logs', (err) => {
+    if (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+    res.json({ success: true, message: 'All logs cleared successfully' });
+  });
+});
+
 // Logger page with UUID path (dynamic route handler)
 app.get('/:uuid/logger', (req, res) => {
   // Check if the UUID matches any of the current UUIDs
@@ -1551,11 +1561,64 @@ app.get('/:uuid/logger', (req, res) => {
   <div style="text-align: center; margin-bottom: 30px;">
     <a href="/objects" class="nav-link">🔍 Browser Objects Explorer</a>
     <a href="/logs" class="nav-link">📋 View Logs API</a>
+    <button id="clearLogsBtn" style="background-color: #dc3545; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin: 10px 5px; cursor: pointer; font-size: 14px; transition: background-color 0.3s;">🗑️ Clear Logs</button>
   </div>
   
-  <div class="log-entries">
+  <div class="log-entries" id="logEntries">
     ${entriesHtml}
   </div>
+  
+  <script>
+    window.addEventListener('load', function() {
+      const clearLogsBtn = document.getElementById('clearLogsBtn');
+      if (!clearLogsBtn) return;
+      
+      clearLogsBtn.addEventListener('click', async function() {
+        if (!confirm('Are you sure you want to clear all logs? This action cannot be undone.')) {
+          return;
+        }
+        
+        const btn = this;
+        const logEntries = document.getElementById('logEntries');
+        
+        btn.disabled = true;
+        btn.textContent = '⏳ Clearing...';
+        btn.style.backgroundColor = '#95a5a6';
+        
+        try {
+          const response = await fetch('/clear-logs', {
+            method: 'DELETE',
+            headers: {
+              'Content-Type': 'application/json'
+            }
+          });
+          
+          const data = await response.json();
+          
+          if (data.success) {
+            // Clear the log entries display
+            logEntries.innerHTML = '<div style="text-align: center; padding: 40px; color: #95a5a6;"><p>No logs available. All logs have been cleared.</p></div>';
+            
+            btn.textContent = '✓ Cleared!';
+            btn.style.backgroundColor = '#28a745';
+            
+            setTimeout(() => {
+              btn.disabled = false;
+              btn.textContent = '🗑️ Clear Logs';
+              btn.style.backgroundColor = '#dc3545';
+            }, 2000);
+          } else {
+            throw new Error(data.error || 'Failed to clear logs');
+          }
+        } catch (error) {
+          alert('Error clearing logs: ' + error.message);
+          btn.disabled = false;
+          btn.textContent = '🗑️ Clear Logs';
+          btn.style.backgroundColor = '#dc3545';
+        }
+      });
+    });
+  </script>
   
   ${fingerprintScript}
 </body>
