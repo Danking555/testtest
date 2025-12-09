@@ -223,11 +223,32 @@ function parseContentType(contentType) {
 
 // Network fingerprinting function
 function extractNetworkFingerprint(req, startTime) {
+  // Extract real client IP from various proxy headers (priority order)
+  // Cloudflare -> X-Real-IP -> X-Forwarded-For -> Express trust proxy -> Direct connection
+  const getRealClientIP = () => {
+    if (req.headers['cf-connecting-ip']) {
+      return req.headers['cf-connecting-ip'].split(',')[0].trim();
+    }
+    if (req.headers['x-real-ip']) {
+      return req.headers['x-real-ip'].split(',')[0].trim();
+    }
+    if (req.headers['x-forwarded-for']) {
+      return req.headers['x-forwarded-for'].split(',')[0].trim();
+    }
+    if (req.ip && req.ip !== '::1' && req.ip !== '127.0.0.1') {
+      return req.ip;
+    }
+    return req.connection?.remoteAddress || req.socket?.remoteAddress || 'unknown';
+  };
+  
+  const realClientIP = getRealClientIP();
+  
   const fingerprint = {
-    // IP and connection info
-    ip: req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown',
+    // IP and connection info (use real client IP from proxy headers)
+    ip: realClientIP,
     forwardedFor: req.headers['x-forwarded-for'],
     realIp: req.headers['x-real-ip'],
+    cfConnectingIp: req.headers['cf-connecting-ip'], // Cloudflare
     via: req.headers['via'],
     
     // Connection details
@@ -242,10 +263,10 @@ function extractNetworkFingerprint(req, startTime) {
       family: req.connection.remoteFamily || null
     } : null,
     
-    // HTTP version and protocol
+    // HTTP version and protocol (check for proxy headers)
     httpVersion: req.httpVersion,
-    protocol: req.protocol,
-    secure: req.secure || req.protocol === 'https',
+    protocol: req.headers['x-forwarded-proto'] || req.headers['x-forwarded-protocol'] || req.protocol,
+    secure: req.headers['x-forwarded-proto'] === 'https' || req.headers['x-forwarded-protocol'] === 'https' || req.secure || req.protocol === 'https',
     
     // HTTP/2 detection
     http2: req.httpVersion === '2.0' || req.httpVersionMajor === 2,
@@ -357,11 +378,16 @@ function extractNetworkFingerprint(req, startTime) {
       }
     })() : null,
     
-    // IP Geolocation and ASN (passive lookup)
+    // IP Geolocation and ASN (passive lookup) - use real client IP
     geoip: (() => {
       try {
-        const ip = req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress;
-        if (ip && ip !== '::1' && ip !== '127.0.0.1' && !ip.startsWith('::ffff:127.') && !ip.startsWith('::ffff:192.168.') && !ip.startsWith('::ffff:10.')) {
+        const ip = realClientIP;
+        // Skip local/private IPs and IPv6 localhost/link-local
+        if (ip && ip !== 'unknown' && ip !== '::1' && ip !== '127.0.0.1' && 
+            !ip.startsWith('::ffff:127.') && !ip.startsWith('::ffff:192.168.') && 
+            !ip.startsWith('::ffff:10.') && !ip.startsWith('192.168.') && 
+            !ip.startsWith('10.') && !ip.startsWith('172.') &&
+            !ip.startsWith('fc00:') && !ip.startsWith('fe80:')) {
           const geo = geoip.lookup(ip);
           if (geo) {
             return {
@@ -455,10 +481,12 @@ const tlsFingerprints = new Map();
 function getASNInfo(ip) {
   return new Promise((resolve) => {
     try {
-      // Skip local/private IPs
-      if (!ip || ip === '::1' || ip === '127.0.0.1' || ip.startsWith('::ffff:127.') || 
-          ip.startsWith('::ffff:192.168.') || ip.startsWith('::ffff:10.') || 
-          ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
+      // Skip local/private IPs and IPv6 localhost/link-local
+      if (!ip || ip === 'unknown' || ip === '::1' || ip === '127.0.0.1' || 
+          ip.startsWith('::ffff:127.') || ip.startsWith('::ffff:192.168.') || 
+          ip.startsWith('::ffff:10.') || ip.startsWith('192.168.') || 
+          ip.startsWith('10.') || ip.startsWith('172.') ||
+          ip.startsWith('fc00:') || ip.startsWith('fe80:')) {
         return resolve(null);
       }
       
@@ -520,7 +548,7 @@ app.use(async (req, res, next) => {
     networkFingerprint.tls = tlsFingerprints.get(connectionId);
     // Clean up after use
     tlsFingerprints.delete(connectionId);
-  } else if (req.secure || req.protocol === 'https') {
+  } else if (networkFingerprint.secure || req.secure || req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https') {
     // Try to extract TLS info from secure connection
     networkFingerprint.tls = {
       secure: true,
