@@ -15,46 +15,130 @@
 
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const path = require('path');
 const os = require('os');
 const sqlite3 = require('sqlite3').verbose();
 const WebSocket = require('ws');
+const { readTlsClientHello } = require('read-tls-client-hello');
+const useragent = require('useragent');
+const geoip = require('geoip-lite');
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
 const port = process.env.PORT || 3000;
 
-// Generate random UUID for logger path (changes every 5 minutes)
-const crypto = require('crypto');
-let LOGGER_UUID = crypto.randomUUID();
-let LOGGER_PATH = `/${LOGGER_UUID}/logger`;
-
-// Function to regenerate UUID and update path
-function regenerateLoggerUUID() {
-  LOGGER_UUID = crypto.randomUUID();
-  LOGGER_PATH = `/${LOGGER_UUID}/logger`;
-  console.log('Logger UUID regenerated:', LOGGER_UUID);
-  return LOGGER_UUID;
+// JA4 fingerprint calculation function
+function calculateJA4(tlsData) {
+  if (!tlsData) return null;
+  
+  try {
+    // JA4 format: tls_version_cipher_suites_extension_ec_ecpf
+    // Simplified version - full JA4 requires complete TLS handshake parsing
+    const version = tlsData.version || '0000';
+    const cipherSuites = (tlsData.cipherSuites || []).slice(0, 5).join(',');
+    const extensions = (tlsData.extensions || []).slice(0, 10).map(e => e.type || e).join(',');
+    const ec = tlsData.ecCurves || tlsData.supportedGroups || '';
+    const ecpf = tlsData.ecPointFormats || '';
+    
+    const ja4 = `${version}_${cipherSuites}_${extensions}_${ec}_${ecpf}`;
+    return crypto.createHash('md5').update(ja4).digest('hex').substring(0, 12);
+  } catch (e) {
+    return { error: e.message };
+  }
 }
 
-// Regenerate UUID every 5 minutes (300000 ms)
+// Enhanced TLS fingerprinting (for HTTPS connections)
+async function extractTLSFingerprint(socket) {
+  try {
+    if (socket.encrypted || socket.getProtocol) {
+      // Try to read TLS ClientHello if available
+      try {
+        const clientHello = await readTlsClientHello(socket);
+        
+        return {
+          ja4: calculateJA4(clientHello),
+          ja4h: null, // JA4H requires HTTP/2, can be added later
+          tlsVersion: clientHello.version,
+          cipherSuites: clientHello.cipherSuites,
+          extensions: clientHello.extensions,
+          sni: clientHello.servername,
+          alpn: clientHello.alpn,
+          supportedGroups: clientHello.supportedGroups,
+          ecPointFormats: clientHello.ecPointFormats,
+          signatureAlgorithms: clientHello.signatureAlgorithms,
+          raw: {
+            version: clientHello.version,
+            cipherCount: clientHello.cipherSuites?.length || 0,
+            extensionCount: clientHello.extensions?.length || 0
+          }
+        };
+      } catch (e) {
+        // If readTlsClientHello fails, try to get basic TLS info from socket
+        if (socket.getProtocol && socket.getCipher) {
+          return {
+            protocol: socket.getProtocol(),
+            cipher: socket.getCipher(),
+            note: 'Basic TLS info only (ClientHello not captured)'
+          };
+        }
+        return null;
+      }
+    }
+    return null;
+  } catch (e) {
+    // TLS handshake not available or not HTTPS
+    return null;
+  }
+}
+
+// Handle TLS connections for HTTPS (if using HTTPS server)
+// Note: This requires using https.createServer instead of http.createServer for HTTPS
+if (server instanceof https.Server) {
+  server.on('secureConnection', (socket) => {
+    const connectionId = socket.remoteAddress + ':' + socket.remotePort;
+    extractTLSFingerprint(socket).then(tlsFp => {
+      if (tlsFp) {
+        tlsFingerprints.set(connectionId, tlsFp);
+      }
+    }).catch(() => {
+      // Ignore errors
+    });
+  });
+}
+
+// Generate multiple random UUIDs for logger paths (at least 10, changes every 5 minutes)
+const LOGGER_COUNT = Math.max(10, parseInt(process.env.LOGGER_COUNT) || 10);
+let LOGGER_UUIDS = Array.from({ length: LOGGER_COUNT }, () => crypto.randomUUID());
+let LOGGER_PATHS = LOGGER_UUIDS.map(uuid => ({ uuid, path: `/${uuid}/logger` }));
+
+// Function to regenerate all UUIDs and update paths
+function regenerateLoggerUUIDs() {
+  LOGGER_UUIDS = Array.from({ length: LOGGER_COUNT }, () => crypto.randomUUID());
+  LOGGER_PATHS = LOGGER_UUIDS.map(uuid => ({ uuid, path: `/${uuid}/logger` }));
+  console.log(`Logger UUIDs regenerated: ${LOGGER_UUIDS.length} paths`);
+  return LOGGER_PATHS;
+}
+
+// Regenerate UUIDs every 5 minutes (300000 ms)
 const UUID_REGEN_INTERVAL = process.env.UUID_REGEN_INTERVAL || 300000; // 5 minutes default
 setInterval(() => {
-  regenerateLoggerUUID();
+  regenerateLoggerUUIDs();
 }, UUID_REGEN_INTERVAL);
 
 // JSON parsing for any future needs
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // For form data
 
-// Route to regenerate UUID manually
+// Route to regenerate UUIDs manually
 app.post('/regenerate-uuid', (req, res) => {
-  const newUUID = regenerateLoggerUUID();
+  const newPaths = regenerateLoggerUUIDs();
   res.json({ 
     success: true, 
-    uuid: newUUID, 
-    loggerPath: LOGGER_PATH,
-    message: 'UUID regenerated successfully'
+    paths: newPaths,
+    count: newPaths.length,
+    message: 'UUIDs regenerated successfully'
   });
 });
 
@@ -79,21 +163,474 @@ db.serialize(() => {
       url TEXT,
       headers TEXT,
       body TEXT,
-      timestamp TEXT
+      timestamp TEXT,
+      network_fingerprint TEXT
     )
   `);
+  
+  // Add network_fingerprint column if it doesn't exist (for existing databases)
+  db.run(`
+    ALTER TABLE logs ADD COLUMN network_fingerprint TEXT
+  `, (err) => {
+    // Ignore error if column already exists
+  });
 });
 
-// Middleware: log every HTTP request (method, url, headers, body, timestamp)
-app.use((req, res, next) => {
+// Helper function to parse cookies
+function parseCookies(cookieHeader) {
+  if (!cookieHeader) return null;
+  try {
+    const cookies = {};
+    const cookieNames = [];
+    cookieHeader.split(';').forEach(cookie => {
+      const [name, ...valueParts] = cookie.trim().split('=');
+      if (name) {
+        const value = valueParts.join('=');
+        cookies[name] = value || '';
+        cookieNames.push(name);
+      }
+    });
+    return {
+      count: cookieNames.length,
+      names: cookieNames,
+      namesHash: crypto.createHash('sha256').update(cookieNames.sort().join(',')).digest('hex')
+    };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+// Helper function to parse Content-Type
+function parseContentType(contentType) {
+  if (!contentType) return null;
+  try {
+    const [type, ...params] = contentType.split(';');
+    const parsed = {
+      type: type.trim(),
+      charset: null,
+      boundary: null
+    };
+    params.forEach(param => {
+      const [key, value] = param.trim().split('=');
+      if (key === 'charset') parsed.charset = value?.trim();
+      if (key === 'boundary') parsed.boundary = value?.trim();
+    });
+    return parsed;
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+// Network fingerprinting function
+function extractNetworkFingerprint(req, startTime) {
+  const fingerprint = {
+    // IP and connection info
+    ip: req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown',
+    forwardedFor: req.headers['x-forwarded-for'],
+    realIp: req.headers['x-real-ip'],
+    via: req.headers['via'],
+    
+    // Connection details
+    connection: req.connection ? {
+      remoteAddress: req.connection.remoteAddress,
+      remotePort: req.connection.remotePort,
+      localAddress: req.connection.localAddress,
+      localPort: req.connection.localPort,
+      bytesRead: req.connection.bytesRead,
+      bytesWritten: req.connection.bytesWritten,
+      // Connection family (IPv4 vs IPv6)
+      family: req.connection.remoteFamily || null
+    } : null,
+    
+    // HTTP version and protocol
+    httpVersion: req.httpVersion,
+    protocol: req.protocol,
+    secure: req.secure || req.protocol === 'https',
+    
+    // HTTP/2 detection
+    http2: req.httpVersion === '2.0' || req.httpVersionMajor === 2,
+    http2StreamId: req.stream?.id || null,
+    http2Priority: req.stream?.priority || null,
+    
+    // Complete header capture (all headers)
+    allHeaders: req.headers,
+    
+    // Header fingerprinting
+    headerFingerprint: {
+      // Header order (important for fingerprinting)
+      headerOrder: Object.keys(req.headers).join(','),
+      headerCount: Object.keys(req.headers).length,
+      // Hash of header structure (excluding IPs and ports) - stable fingerprint
+      headerStructureHash: crypto.createHash('sha256')
+        .update(Object.keys(req.headers)
+          .filter(h => !['x-forwarded-for', 'x-real-ip', 'via', 'host'].includes(h.toLowerCase()))
+          .sort()
+          .join(',') + 
+          Object.entries(req.headers)
+            .filter(([k]) => !['x-forwarded-for', 'x-real-ip', 'via', 'host'].includes(k.toLowerCase()))
+            .map(([k, v]) => k + ':' + (v ? v.substring(0, 100).replace(/\d+\.\d+\.\d+\.\d+/g, 'IP').replace(/:\d{4,}/g, ':PORT') : ''))
+            .sort()
+            .join('|'))
+        .digest('hex'),
+      
+      // Specific headers for fingerprinting
+      acceptLanguage: req.headers['accept-language'],
+      acceptEncoding: req.headers['accept-encoding'],
+      accept: req.headers['accept'],
+      userAgent: req.headers['user-agent'],
+      dnt: req.headers['dnt'],
+      secFetchSite: req.headers['sec-fetch-site'],
+      secFetchMode: req.headers['sec-fetch-mode'],
+      secFetchUser: req.headers['sec-fetch-user'],
+      secFetchDest: req.headers['sec-fetch-dest'],
+      secChUa: req.headers['sec-ch-ua'],
+      secChUaPlatform: req.headers['sec-ch-ua-platform'],
+      secChUaMobile: req.headers['sec-ch-ua-mobile'],
+      upgradeInsecureRequests: req.headers['upgrade-insecure-requests'],
+      cacheControl: req.headers['cache-control'],
+      pragma: req.headers['pragma'],
+      authorization: req.headers['authorization'] ? (req.headers['authorization'].split(' ')[0] || null) : null, // Type only
+      range: req.headers['range'],
+      ifNoneMatch: req.headers['if-none-match'],
+      ifModifiedSince: req.headers['if-modified-since'],
+      ifRange: req.headers['if-range'],
+      te: req.headers['te'],
+      connection: req.headers['connection'],
+      expect: req.headers['expect'],
+      from: req.headers['from'],
+      maxForwards: req.headers['max-forwards'],
+      proxyAuthorization: req.headers['proxy-authorization'] ? (req.headers['proxy-authorization'].split(' ')[0] || null) : null, // Type only
+      trailer: req.headers['trailer'],
+      transferEncoding: req.headers['transfer-encoding'],
+      warning: req.headers['warning'],
+      link: req.headers['link'],
+      xRequestedWith: req.headers['x-requested-with'],
+      xForwardedProto: req.headers['x-forwarded-proto'],
+      xForwardedHost: req.headers['x-forwarded-host'],
+      xForwardedPort: req.headers['x-forwarded-port'],
+      
+      // Resource hints
+      resourceHints: {
+        preconnect: req.headers['link']?.includes('rel="preconnect"') || false,
+        prefetch: req.headers['link']?.includes('rel="prefetch"') || false,
+        dnsPrefetch: req.headers['link']?.includes('rel="dns-prefetch"') || false
+      },
+      
+      // Header presence flags
+      hasAcceptLanguage: !!req.headers['accept-language'],
+      hasAcceptEncoding: !!req.headers['accept-encoding'],
+      hasDnt: !!req.headers['dnt'],
+      hasSecFetchSite: !!req.headers['sec-fetch-site'],
+      hasSecFetchMode: !!req.headers['sec-fetch-mode'],
+      hasSecFetchUser: !!req.headers['sec-fetch-user'],
+      hasSecFetchDest: !!req.headers['sec-fetch-dest'],
+      hasSecChUa: !!req.headers['sec-ch-ua'],
+      hasUpgradeInsecureRequests: !!req.headers['upgrade-insecure-requests'],
+      hasAuthorization: !!req.headers['authorization'],
+      hasRange: !!req.headers['range'],
+      hasIfNoneMatch: !!req.headers['if-none-match'],
+      hasIfModifiedSince: !!req.headers['if-modified-since'],
+      hasXRequestedWith: !!req.headers['x-requested-with']
+    },
+    
+    // Cookie analysis
+    cookies: parseCookies(req.headers['cookie']),
+    
+    // User-Agent parsing
+    userAgentParsed: req.headers['user-agent'] ? (() => {
+      try {
+        const agent = useragent.parse(req.headers['user-agent']);
+        return {
+          family: agent.family,
+          major: agent.major,
+          minor: agent.minor,
+          patch: agent.patch,
+          device: agent.device.family,
+          os: {
+            family: agent.os.family,
+            major: agent.os.major,
+            minor: agent.os.minor
+          }
+        };
+      } catch (e) {
+        return { error: e.message };
+      }
+    })() : null,
+    
+    // IP Geolocation and ASN (passive lookup)
+    geoip: (() => {
+      try {
+        const ip = req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress;
+        if (ip && ip !== '::1' && ip !== '127.0.0.1' && !ip.startsWith('::ffff:127.') && !ip.startsWith('::ffff:192.168.') && !ip.startsWith('::ffff:10.')) {
+          const geo = geoip.lookup(ip);
+          if (geo) {
+            return {
+              country: geo.country,
+              countryName: geo.country || null, // Will be enhanced with API if needed
+              region: geo.region,
+              city: geo.city,
+              timezone: geo.timezone,
+              ll: geo.ll, // latitude/longitude
+              latitude: geo.ll ? geo.ll[0] : null,
+              longitude: geo.ll ? geo.ll[1] : null,
+              metro: geo.metro,
+              area: geo.area,
+              range: geo.range,
+              eu: geo.eu === '1',
+              // ASN will be added via async lookup if needed
+              asn: null,
+              asnName: null,
+              isp: null,
+              org: null
+            };
+          }
+        }
+        return null;
+      } catch (e) {
+        return { error: e.message };
+      }
+    })(),
+    
+    // ASN and enhanced geolocation (async - will be populated if API available)
+    asnInfo: null, // Will be populated separately
+    
+    // Request body characteristics
+    bodyCharacteristics: (() => {
+      const body = req.body;
+      const bodyStr = body && Object.keys(body).length ? JSON.stringify(body) : '';
+      const bodySize = req.headers['content-length'] ? parseInt(req.headers['content-length']) : (bodyStr ? Buffer.byteLength(bodyStr, 'utf8') : 0);
+      
+      return {
+        hasBody: !!bodyStr,
+        bodySize: bodySize,
+        contentType: parseContentType(req.headers['content-type']),
+        encoding: req.headers['content-encoding'] || null,
+        // Body hash (for fingerprinting, excluding variable data)
+        bodyHash: bodyStr ? crypto.createHash('sha256')
+          .update(bodyStr.replace(/\d{4}-\d{2}-\d{2}/g, 'DATE').replace(/\d{2}:\d{2}:\d{2}/g, 'TIME'))
+          .digest('hex') : null
+      };
+    })(),
+    
+    // Request characteristics
+    requestCharacteristics: {
+      method: req.method,
+      url: req.url,
+      path: req.path,
+      query: req.query,
+      hostname: req.hostname,
+      subdomain: req.subdomains,
+      contentType: req.headers['content-type'],
+      contentLength: req.headers['content-length'],
+      referer: req.headers['referer'],
+      origin: req.headers['origin'],
+      // URL pattern analysis
+      pathDepth: req.path ? req.path.split('/').filter(p => p).length : 0,
+      queryParamCount: req.query ? Object.keys(req.query).length : 0,
+      hasQuery: !!req.query && Object.keys(req.query).length > 0
+    },
+    
+    // Connection timing
+    timing: (() => {
+      const now = Date.now();
+      const requestTime = new Date().toISOString();
+      const processingTime = startTime ? (now - startTime) : null;
+      
+      return {
+        requestTime: requestTime,
+        processingTimeMs: processingTime,
+        // Connection age (if available)
+        connectionAge: req.connection?.bytesRead ? 'established' : null
+      };
+    })()
+  };
+  
+  return fingerprint;
+}
+
+// Store TLS fingerprints (will be populated by TLS connection handler)
+const tlsFingerprints = new Map();
+
+// Helper function to get ASN info (using ip-api.com free API - passive, no API key needed)
+function getASNInfo(ip) {
+  return new Promise((resolve) => {
+    try {
+      // Skip local/private IPs
+      if (!ip || ip === '::1' || ip === '127.0.0.1' || ip.startsWith('::ffff:127.') || 
+          ip.startsWith('::ffff:192.168.') || ip.startsWith('::ffff:10.') || 
+          ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
+        return resolve(null);
+      }
+      
+      // Use ip-api.com free service (no API key required, 45 requests/minute limit)
+      const https = require('https');
+      const url = `https://ip-api.com/json/${ip}?fields=status,message,country,countryCode,region,regionName,city,lat,lon,timezone,isp,org,as,asname,query`;
+      
+      https.get(url, { timeout: 2000 }, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            const result = JSON.parse(data);
+            if (result.status === 'success') {
+              resolve({
+                asn: result.as ? result.as.split(' ')[0] : null, // Extract ASN number
+                asnName: result.asname || null,
+                asnFull: result.as || null,
+                isp: result.isp || null,
+                org: result.org || null,
+                country: result.country || null,
+                countryCode: result.countryCode || null,
+                region: result.regionName || result.region || null,
+                city: result.city || null,
+                latitude: result.lat || null,
+                longitude: result.lon || null,
+                timezone: result.timezone || null
+              });
+            } else {
+              resolve(null);
+            }
+          } catch (e) {
+            resolve(null);
+          }
+        });
+      }).on('error', () => {
+        resolve(null); // Fail silently
+      });
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
+// Middleware: log every HTTP request with network fingerprinting
+app.use(async (req, res, next) => {
+  const startTime = Date.now();
   const { method, originalUrl: url, headers, body } = req;
   const timestamp = new Date().toISOString();
   const headersStr = JSON.stringify(headers);
   const bodyStr = body && Object.keys(body).length ? JSON.stringify(body) : '';
+  
+  // Extract network fingerprint
+  const networkFingerprint = extractNetworkFingerprint(req, startTime);
+  
+  // Add TLS fingerprint if available (for HTTPS connections)
+  const connectionId = req.connection?.remoteAddress + ':' + req.connection?.remotePort;
+  if (tlsFingerprints.has(connectionId)) {
+    networkFingerprint.tls = tlsFingerprints.get(connectionId);
+    // Clean up after use
+    tlsFingerprints.delete(connectionId);
+  } else if (req.secure || req.protocol === 'https') {
+    // Try to extract TLS info from secure connection
+    networkFingerprint.tls = {
+      secure: true,
+      protocol: req.connection?.getProtocol?.() || null,
+      cipher: req.connection?.getCipher?.() || null,
+      note: 'TLS handshake data not captured (requires TLS interception)'
+    };
+  }
+  
+  // Calculate TCP fingerprint (basic)
+  if (req.connection) {
+    networkFingerprint.tcp = {
+      windowSize: req.connection._writableState?.highWaterMark || null,
+      remoteAddress: req.connection.remoteAddress,
+      remotePort: req.connection.remotePort,
+      localAddress: req.connection.localAddress,
+      localPort: req.connection.localPort,
+      note: 'Full TCP fingerprint requires packet capture (pcap)'
+    };
+  }
+  
+  // Create comprehensive network hash (EXCLUDING IPs and ports - stable fingerprint)
+  // Only use stable characteristics that don't change frequently
+  const stableFingerprint = {
+    httpVersion: networkFingerprint.httpVersion,
+    protocol: networkFingerprint.protocol,
+    secure: networkFingerprint.secure,
+    http2: networkFingerprint.http2,
+    // Header order (stable)
+    headerOrder: networkFingerprint.headerFingerprint.headerOrder,
+    headerCount: networkFingerprint.headerFingerprint.headerCount,
+    // User-Agent (stable per browser)
+    userAgent: networkFingerprint.headerFingerprint.userAgent,
+    // Accept headers (stable per browser)
+    acceptLanguage: networkFingerprint.headerFingerprint.acceptLanguage,
+    acceptEncoding: networkFingerprint.headerFingerprint.acceptEncoding,
+    accept: networkFingerprint.headerFingerprint.accept,
+    // Sec-* headers (stable per browser)
+    secChUa: networkFingerprint.headerFingerprint.secChUa,
+    secChUaPlatform: networkFingerprint.headerFingerprint.secChUaPlatform,
+    secChUaMobile: networkFingerprint.headerFingerprint.secChUaMobile,
+    // TLS fingerprint (stable)
+    tls: networkFingerprint.tls?.ja4 || networkFingerprint.tls?.protocol || 'none',
+    // Cookie names hash (stable)
+    cookieNamesHash: networkFingerprint.cookies?.namesHash || 'none',
+    // User-Agent parsed (stable)
+    uaFamily: networkFingerprint.userAgentParsed?.family || 'none',
+    uaOS: networkFingerprint.userAgentParsed?.os?.family || 'none'
+  };
+  
+  networkFingerprint.networkHash = crypto.createHash('sha256')
+    .update(JSON.stringify(stableFingerprint))
+    .digest('hex');
+  
+  // Try to get ASN info with a short timeout (1 second max wait)
+  const ip = networkFingerprint.ip;
+  if (ip && ip !== 'unknown') {
+    try {
+      const asnInfo = await Promise.race([
+        getASNInfo(ip),
+        new Promise(resolve => setTimeout(() => resolve(null), 1000))
+      ]);
+      
+      if (asnInfo) {
+        // Enhance geoip with ASN data
+        if (networkFingerprint.geoip) {
+          networkFingerprint.geoip.asn = asnInfo.asn;
+          networkFingerprint.geoip.asnName = asnInfo.asnName;
+          networkFingerprint.geoip.asnFull = asnInfo.asnFull;
+          networkFingerprint.geoip.isp = asnInfo.isp;
+          networkFingerprint.geoip.org = asnInfo.org;
+          networkFingerprint.geoip.countryCode = asnInfo.countryCode;
+          // Enhance with more accurate geo data if available
+          if (asnInfo.latitude) networkFingerprint.geoip.latitude = asnInfo.latitude;
+          if (asnInfo.longitude) networkFingerprint.geoip.longitude = asnInfo.longitude;
+          if (asnInfo.city) networkFingerprint.geoip.city = asnInfo.city;
+          if (asnInfo.region) networkFingerprint.geoip.region = asnInfo.region;
+          if (asnInfo.country) networkFingerprint.geoip.country = asnInfo.country;
+          if (asnInfo.timezone) networkFingerprint.geoip.timezone = asnInfo.timezone;
+        } else {
+          // Create geoip object if it doesn't exist
+          networkFingerprint.geoip = {
+            country: asnInfo.country,
+            countryCode: asnInfo.countryCode,
+            region: asnInfo.region,
+            city: asnInfo.city,
+            latitude: asnInfo.latitude,
+            longitude: asnInfo.longitude,
+            timezone: asnInfo.timezone,
+            asn: asnInfo.asn,
+            asnName: asnInfo.asnName,
+            asnFull: asnInfo.asnFull,
+            isp: asnInfo.isp,
+            org: asnInfo.org
+          };
+        }
+        networkFingerprint.asnInfo = asnInfo;
+      }
+    } catch (e) {
+      // Ignore errors, continue without ASN data
+    }
+  }
+  
+  const networkFingerprintStr = JSON.stringify(networkFingerprint);
+  
   db.run(
-    `INSERT INTO logs(method,url,headers,body,timestamp) VALUES(?,?,?,?,?)`,
-    [method, url, headersStr, bodyStr, timestamp]
+    `INSERT INTO logs(method,url,headers,body,timestamp,network_fingerprint) VALUES(?,?,?,?,?,?)`,
+    [method, url, headersStr, bodyStr, timestamp, networkFingerprintStr]
   );
+  
   next();
 });
 
@@ -540,12 +1077,25 @@ function getFingerprintingScript() {
 
 // Root page - just shows the UUID
 app.get('/', (req, res) => {
+  const loggerPathsHtml = LOGGER_PATHS.map((item, index) => `
+    <div class="logger-path-item" data-index="${index}">
+      <div class="path-header">
+        <span class="path-number">#${index + 1}</span>
+        <span class="path-uuid">${item.uuid}</span>
+      </div>
+      <div class="path-url">
+        <code>${req.protocol}://${req.get('host')}${item.path}</code>
+      </div>
+      <a href="${item.path}" class="logger-link-small">🔍 Open Logger</a>
+    </div>
+  `).join('');
+  
   res.send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="robots" content="noindex, nofollow">
-  <title>HTTP Request Logger - UUID</title>
+  <title>HTTP Request Logger - Multiple Paths</title>
   <style>
     body {
       background-color: #1a1a1a;
@@ -553,58 +1103,103 @@ app.get('/', (req, res) => {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       margin: 0;
       padding: 20px;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
     }
     .container {
-      text-align: center;
-      padding: 40px;
-      background-color: #2d2d2d;
-      border: 1px solid #555;
-      border-radius: 8px;
-      max-width: 600px;
+      max-width: 1200px;
+      margin: 0 auto;
     }
     h1 {
       color: #ffffff;
+      text-align: center;
+      margin-bottom: 10px;
+    }
+    .subtitle {
+      text-align: center;
+      color: #95a5a6;
+      margin-bottom: 30px;
+      font-size: 14px;
+    }
+    .logger-paths-container {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+      gap: 20px;
       margin-bottom: 30px;
     }
-    .uuid-display {
+    .logger-path-item {
       background-color: #3d3d3d;
       border: 1px solid #666;
-      border-radius: 4px;
-      padding: 20px;
-      margin: 20px 0;
-      word-break: break-all;
+      border-radius: 8px;
+      padding: 15px;
+      transition: transform 0.2s, box-shadow 0.2s;
     }
-    .uuid-value {
+    .logger-path-item:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+      border-color: #4a90e2;
+    }
+    .path-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .path-number {
+      background-color: #4a90e2;
+      color: white;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-weight: bold;
+      font-size: 12px;
+      min-width: 35px;
+      text-align: center;
+    }
+    .path-uuid {
       color: #4a90e2;
       font-family: monospace;
-      font-size: 18px;
+      font-size: 14px;
       font-weight: bold;
-      margin: 10px 0;
+      word-break: break-all;
+      flex: 1;
     }
-    .logger-link {
+    .path-url {
+      background-color: #2d2d2d;
+      padding: 8px;
+      border-radius: 4px;
+      margin-bottom: 10px;
+      word-break: break-all;
+    }
+    .path-url code {
+      color: #b0b0b0;
+      font-size: 12px;
+    }
+    .logger-link-small {
       display: inline-block;
       background-color: #007bff;
       color: white;
-      padding: 12px 24px;
+      padding: 8px 16px;
       text-decoration: none;
-      border-radius: 6px;
-      margin-top: 20px;
+      border-radius: 4px;
+      font-size: 13px;
       transition: background-color 0.3s;
+      width: 100%;
+      text-align: center;
+      box-sizing: border-box;
     }
-    .logger-link:hover {
+    .logger-link-small:hover {
       background-color: #0056b3;
     }
+    .controls {
+      text-align: center;
+      margin-top: 30px;
+      padding-top: 20px;
+      border-top: 1px solid #666;
+    }
     button {
-      margin-top: 10px;
       background-color: #f39c12;
       color: white;
       border: none;
       border-radius: 4px;
-      padding: 8px 16px;
+      padding: 12px 24px;
       cursor: pointer;
       font-size: 14px;
       transition: background-color 0.3s;
@@ -617,8 +1212,8 @@ app.get('/', (req, res) => {
       cursor: not-allowed;
     }
     #uuidStatus {
-      margin-top: 8px;
-      font-size: 12px;
+      margin-top: 10px;
+      font-size: 14px;
       display: none;
     }
   </style>
@@ -626,16 +1221,14 @@ app.get('/', (req, res) => {
 <body>
   <div class="container">
     <h1>🌐 HTTP Request Logger</h1>
-    <div class="uuid-display">
-      <p style="margin: 0; color: #b0b0b0; font-size: 14px;">Logger UUID:</p>
-      <p class="uuid-value" id="loggerUuid">${LOGGER_UUID}</p>
-      <p style="margin: 10px 0 0 0; color: #95a5a6; font-size: 12px;">
-        Logger URL: <code style="background: #2d2d2d; padding: 2px 6px; border-radius: 3px;">${req.protocol}://${req.get('host')}${LOGGER_PATH}</code>
-      </p>
+    <p class="subtitle">${LOGGER_PATHS.length} Active Logger Paths</p>
+    
+    <div class="logger-paths-container" id="loggerPathsContainer">
+      ${loggerPathsHtml}
     </div>
-    <a href="${LOGGER_PATH}" class="logger-link">🔍 Go to Logger</a>
-    <div style="margin-top: 20px;">
-      <button id="regenerateUuidBtn">🔄 Regenerate UUID</button>
+    
+    <div class="controls">
+      <button id="regenerateUuidBtn">🔄 Regenerate All UUIDs</button>
       <div id="uuidStatus"></div>
     </div>
   </div>
@@ -648,7 +1241,7 @@ app.get('/', (req, res) => {
       regenerateBtn.addEventListener('click', async function() {
         const btn = this;
         const statusDiv = document.getElementById('uuidStatus');
-        const loggerUuidEl = document.getElementById('loggerUuid');
+        const container = document.getElementById('loggerPathsContainer');
         
         btn.disabled = true;
         btn.textContent = '⏳ Regenerating...';
@@ -663,19 +1256,22 @@ app.get('/', (req, res) => {
           
           const data = await response.json();
           
-          if (data.success) {
-            loggerUuidEl.textContent = data.uuid;
-            // Update the logger link URL
-            const loggerLink = document.querySelector('.logger-link');
-            if (loggerLink) {
-              loggerLink.href = data.loggerPath;
-            }
-            // Update the logger URL display if it exists
-            const loggerUrlEl = document.querySelector('code');
-            if (loggerUrlEl && loggerUrlEl.textContent.includes('logger')) {
-              loggerUrlEl.textContent = window.location.protocol + '//' + window.location.host + data.loggerPath;
-            }
-            statusDiv.textContent = '✓ UUID regenerated successfully!';
+          if (data.success && data.paths) {
+            // Update all logger paths
+            container.innerHTML = data.paths.map((item, index) => \`
+              <div class="logger-path-item" data-index="\${index}">
+                <div class="path-header">
+                  <span class="path-number">#\${index + 1}</span>
+                  <span class="path-uuid">\${item.uuid}</span>
+                </div>
+                <div class="path-url">
+                  <code>\${window.location.protocol}//\${window.location.host}\${item.path}</code>
+                </div>
+                <a href="\${item.path}" class="logger-link-small">🔍 Open Logger</a>
+              </div>
+            \`).join('');
+            
+            statusDiv.textContent = \`✓ \${data.count} UUIDs regenerated successfully!\`;
             statusDiv.style.color = '#28a745';
             statusDiv.style.display = 'block';
             
@@ -683,7 +1279,7 @@ app.get('/', (req, res) => {
               statusDiv.style.display = 'none';
             }, 3000);
           } else {
-            throw new Error(data.message || 'Failed to regenerate UUID');
+            throw new Error(data.message || 'Failed to regenerate UUIDs');
           }
         } catch (error) {
           statusDiv.textContent = '✗ Error: ' + error.message;
@@ -695,7 +1291,7 @@ app.get('/', (req, res) => {
           }, 3000);
         } finally {
           btn.disabled = false;
-          btn.textContent = '🔄 Regenerate UUID';
+          btn.textContent = '🔄 Regenerate All UUIDs';
         }
       });
     });
@@ -706,22 +1302,155 @@ app.get('/', (req, res) => {
 
 // Logger page with UUID path (dynamic route handler)
 app.get('/:uuid/logger', (req, res) => {
-  // Check if the UUID matches the current one
-  if (req.params.uuid !== LOGGER_UUID) {
-    return res.redirect(`/${LOGGER_UUID}/logger`);
+  // Check if the UUID matches any of the current UUIDs
+  if (!LOGGER_UUIDS.includes(req.params.uuid)) {
+    // Redirect to the first available logger path
+    return res.redirect(LOGGER_PATHS[0].path);
   }
   
-  db.all(`SELECT method,url,headers,body,timestamp FROM logs ORDER BY id DESC`, (err, rows) => {
+  db.all(`SELECT method,url,headers,body,timestamp,network_fingerprint FROM logs ORDER BY id DESC`, (err, rows) => {
     if (err) return res.status(500).send('Error reading logs');
 
-    const entriesHtml = rows.map(r => `
+    const entriesHtml = rows.map(r => {
+      let networkFpHtml = '';
+      try {
+        const networkFp = r.network_fingerprint ? JSON.parse(r.network_fingerprint) : null;
+        if (networkFp) {
+          networkFpHtml = `
+        <h3>🌐 Network Fingerprint:</h3>
+        <div style="background-color: #3d3d3d; border: 1px solid #666; border-radius: 4px; padding: 15px; margin-bottom: 15px;">
+          <div style="margin-bottom: 10px;">
+            <strong style="color: #4a90e2;">IP:</strong> <code>${networkFp.ip || 'unknown'}</code>
+            ${networkFp.geoip ? ` <span style="color: #95a5a6;">(${networkFp.geoip.country || 'unknown'}, ${networkFp.geoip.city || 'unknown'})</span>` : ''}
+          </div>
+          ${networkFp.geoip ? `
+          <div style="margin-bottom: 10px; padding: 10px; background: #2d2d2d; border-radius: 4px;">
+            <strong style="color: #00bcd4;">🌍 Geolocation:</strong>
+            <div><strong>Country:</strong> <code>${networkFp.geoip.country || 'N/A'}</code>${networkFp.geoip.countryCode ? ` (${networkFp.geoip.countryCode})` : ''}</div>
+            ${networkFp.geoip.region ? `<div><strong>Region:</strong> <code>${networkFp.geoip.region}</code></div>` : ''}
+            ${networkFp.geoip.city ? `<div><strong>City:</strong> <code>${networkFp.geoip.city}</code></div>` : ''}
+            ${networkFp.geoip.latitude && networkFp.geoip.longitude ? `<div><strong>Coordinates:</strong> <code>${networkFp.geoip.latitude}, ${networkFp.geoip.longitude}</code></div>` : ''}
+            ${networkFp.geoip.timezone ? `<div><strong>Timezone:</strong> <code>${networkFp.geoip.timezone}</code></div>` : ''}
+            ${networkFp.geoip.eu !== undefined ? `<div><strong>EU:</strong> <code>${networkFp.geoip.eu ? 'Yes' : 'No'}</code></div>` : ''}
+          </div>
+          ` : ''}
+          ${networkFp.geoip?.asn || networkFp.asnInfo ? `
+          <div style="margin-bottom: 10px; padding: 10px; background: #2d2d2d; border-radius: 4px;">
+            <strong style="color: #9c27b0;">🔗 ASN (Autonomous System):</strong>
+            ${networkFp.geoip?.asn || networkFp.asnInfo?.asn ? `<div><strong>ASN Number:</strong> <code>AS${networkFp.geoip?.asn || networkFp.asnInfo?.asn}</code></div>` : ''}
+            ${networkFp.geoip?.asnName || networkFp.asnInfo?.asnName ? `<div><strong>ASN Name:</strong> <code>${networkFp.geoip?.asnName || networkFp.asnInfo?.asnName}</code></div>` : ''}
+            ${networkFp.geoip?.asnFull || networkFp.asnInfo?.asnFull ? `<div><strong>ASN Full:</strong> <code>${networkFp.geoip?.asnFull || networkFp.asnInfo?.asnFull}</code></div>` : ''}
+            ${networkFp.geoip?.isp || networkFp.asnInfo?.isp ? `<div><strong>ISP:</strong> <code>${networkFp.geoip?.isp || networkFp.asnInfo?.isp}</code></div>` : ''}
+            ${networkFp.geoip?.org || networkFp.asnInfo?.org ? `<div><strong>Organization:</strong> <code>${networkFp.geoip?.org || networkFp.asnInfo?.org}</code></div>` : ''}
+          </div>
+          ` : ''}
+          <div style="margin-bottom: 10px;">
+            <strong style="color: #4a90e2;">HTTP Version:</strong> <code>${networkFp.httpVersion || 'unknown'}</code>
+            <strong style="color: #4a90e2; margin-left: 15px;">Protocol:</strong> <code>${networkFp.protocol || 'unknown'}</code>
+            <strong style="color: #4a90e2; margin-left: 15px;">Secure:</strong> <code>${networkFp.secure ? 'Yes' : 'No'}</code>
+            ${networkFp.http2 ? `<strong style="color: #28a745; margin-left: 15px;">HTTP/2:</strong> <code>Yes</code>` : ''}
+          </div>
+          ${networkFp.http2 && networkFp.http2StreamId ? `
+          <div style="margin-bottom: 10px; padding: 10px; background: #2d2d2d; border-radius: 4px;">
+            <strong style="color: #28a745;">🚀 HTTP/2 Info:</strong>
+            <div><strong>Stream ID:</strong> <code>${networkFp.http2StreamId}</code></div>
+            ${networkFp.http2Priority ? `<div><strong>Priority:</strong> <code>${JSON.stringify(networkFp.http2Priority)}</code></div>` : ''}
+          </div>
+          ` : ''}
+          ${networkFp.tls ? `
+          <div style="margin-bottom: 10px; padding: 10px; background: #2d2d2d; border-radius: 4px;">
+            <strong style="color: #f39c12;">🔒 TLS Fingerprint:</strong>
+            ${networkFp.tls.ja4 ? `<div><strong>JA4:</strong> <code style="color: #28a745;">${networkFp.tls.ja4}</code></div>` : ''}
+            ${networkFp.tls.protocol ? `<div><strong>TLS Protocol:</strong> <code>${networkFp.tls.protocol}</code></div>` : ''}
+            ${networkFp.tls.cipher ? `<div><strong>Cipher:</strong> <code>${networkFp.tls.cipher.name || networkFp.tls.cipher}</code></div>` : ''}
+            ${networkFp.tls.sni ? `<div><strong>SNI:</strong> <code>${networkFp.tls.sni}</code></div>` : ''}
+          </div>
+          ` : ''}
+          ${networkFp.tcp ? `
+          <div style="margin-bottom: 10px; padding: 10px; background: #2d2d2d; border-radius: 4px;">
+            <strong style="color: #9b59b6;">🔌 TCP Info:</strong>
+            <div><strong>Remote:</strong> <code>${networkFp.tcp.remoteAddress}:${networkFp.tcp.remotePort}</code></div>
+            <div><strong>Local:</strong> <code>${networkFp.tcp.localAddress}:${networkFp.tcp.localPort}</code></div>
+            ${networkFp.connection?.family ? `<div><strong>Family:</strong> <code>${networkFp.connection.family}</code></div>` : ''}
+          </div>
+          ` : ''}
+          ${networkFp.cookies ? `
+          <div style="margin-bottom: 10px; padding: 10px; background: #2d2d2d; border-radius: 4px;">
+            <strong style="color: #e91e63;">🍪 Cookies:</strong>
+            <div><strong>Count:</strong> <code>${networkFp.cookies.count || 0}</code></div>
+            ${networkFp.cookies.names && networkFp.cookies.names.length > 0 ? `<div><strong>Names:</strong> <code>${networkFp.cookies.names.join(', ')}</code></div>` : ''}
+            ${networkFp.cookies.namesHash ? `<div><strong>Names Hash:</strong> <code style="font-size: 10px;">${networkFp.cookies.namesHash}</code></div>` : ''}
+          </div>
+          ` : ''}
+          ${networkFp.bodyCharacteristics ? `
+          <div style="margin-bottom: 10px; padding: 10px; background: #2d2d2d; border-radius: 4px;">
+            <strong style="color: #9c27b0;">📦 Body Characteristics:</strong>
+            <div><strong>Has Body:</strong> <code>${networkFp.bodyCharacteristics.hasBody ? 'Yes' : 'No'}</code></div>
+            ${networkFp.bodyCharacteristics.bodySize ? `<div><strong>Size:</strong> <code>${networkFp.bodyCharacteristics.bodySize} bytes</code></div>` : ''}
+            ${networkFp.bodyCharacteristics.contentType ? `<div><strong>Content-Type:</strong> <code>${networkFp.bodyCharacteristics.contentType.type || 'N/A'}</code>${networkFp.bodyCharacteristics.contentType.charset ? ` (charset: ${networkFp.bodyCharacteristics.contentType.charset})` : ''}</div>` : ''}
+            ${networkFp.bodyCharacteristics.encoding ? `<div><strong>Encoding:</strong> <code>${networkFp.bodyCharacteristics.encoding}</code></div>` : ''}
+            ${networkFp.bodyCharacteristics.bodyHash ? `<div><strong>Body Hash:</strong> <code style="font-size: 10px;">${networkFp.bodyCharacteristics.bodyHash}</code></div>` : ''}
+          </div>
+          ` : ''}
+          <div style="margin-bottom: 10px;">
+            <strong style="color: #4a90e2;">Header Fingerprint:</strong>
+            <div style="margin-top: 5px;">
+              <code style="font-size: 11px; color: #b0b0b0;">${networkFp.headerFingerprint?.headerStructureHash || 'N/A'}</code>
+            </div>
+            <div style="margin-top: 5px; font-size: 12px; color: #95a5a6;">
+              Headers: ${networkFp.headerFingerprint?.headerCount || 0} | All Headers: ${networkFp.allHeaders ? Object.keys(networkFp.allHeaders).length : 0} | Order: ${networkFp.headerFingerprint?.headerOrder?.substring(0, 100) || 'N/A'}...
+            </div>
+            ${networkFp.headerFingerprint?.resourceHints ? `
+            <div style="margin-top: 5px; font-size: 12px; color: #95a5a6;">
+              Resource Hints: ${networkFp.headerFingerprint.resourceHints.preconnect ? 'preconnect ' : ''}${networkFp.headerFingerprint.resourceHints.prefetch ? 'prefetch ' : ''}${networkFp.headerFingerprint.resourceHints.dnsPrefetch ? 'dns-prefetch' : ''}
+            </div>
+            ` : ''}
+          </div>
+          ${networkFp.userAgentParsed ? `
+          <div style="margin-bottom: 10px; padding: 10px; background: #2d2d2d; border-radius: 4px;">
+            <strong style="color: #e67e22;">👤 User-Agent Parsed:</strong>
+            <div><strong>Browser:</strong> <code>${networkFp.userAgentParsed.family || 'unknown'} ${networkFp.userAgentParsed.major || ''}.${networkFp.userAgentParsed.minor || ''}</code></div>
+            ${networkFp.userAgentParsed.os ? `<div><strong>OS:</strong> <code>${networkFp.userAgentParsed.os.family || 'unknown'} ${networkFp.userAgentParsed.os.major || ''}.${networkFp.userAgentParsed.os.minor || ''}</code></div>` : ''}
+            ${networkFp.userAgentParsed.device ? `<div><strong>Device:</strong> <code>${networkFp.userAgentParsed.device || 'unknown'}</code></div>` : ''}
+          </div>
+          ` : ''}
+          ${networkFp.timing ? `
+          <div style="margin-bottom: 10px; padding: 10px; background: #2d2d2d; border-radius: 4px;">
+            <strong style="color: #00bcd4;">⏱️ Timing:</strong>
+            <div><strong>Request Time:</strong> <code>${networkFp.timing.requestTime || 'N/A'}</code></div>
+            ${networkFp.timing.processingTimeMs !== null ? `<div><strong>Processing Time:</strong> <code>${networkFp.timing.processingTimeMs} ms</code></div>` : ''}
+            ${networkFp.timing.connectionAge ? `<div><strong>Connection Age:</strong> <code>${networkFp.timing.connectionAge}</code></div>` : ''}
+          </div>
+          ` : ''}
+          ${networkFp.requestCharacteristics ? `
+          <div style="margin-bottom: 10px; padding: 10px; background: #2d2d2d; border-radius: 4px;">
+            <strong style="color: #ff9800;">📋 Request Characteristics:</strong>
+            <div><strong>Method:</strong> <code>${networkFp.requestCharacteristics.method || 'N/A'}</code></div>
+            <div><strong>Path Depth:</strong> <code>${networkFp.requestCharacteristics.pathDepth || 0}</code></div>
+            <div><strong>Query Params:</strong> <code>${networkFp.requestCharacteristics.queryParamCount || 0}</code></div>
+            ${networkFp.requestCharacteristics.hasQuery ? `<div><strong>Has Query:</strong> <code>Yes</code></div>` : ''}
+          </div>
+          ` : ''}
+          <div style="margin-top: 10px; padding: 8px; background: #1a1a1a; border-radius: 4px;">
+            <strong style="color: #e74c3c;">Network Hash (Stable):</strong> <code style="font-size: 10px;">${networkFp.networkHash || 'N/A'}</code>
+          </div>
+        </div>
+          `;
+        }
+      } catch (e) {
+        networkFpHtml = `<h3>🌐 Network Fingerprint:</h3><pre style="color: #e74c3c;">Error parsing: ${e.message}</pre>`;
+      }
+      
+      return `
       <div class="log-entry">
         <h2>[${r.timestamp}] ${r.method} ${r.url}</h2>
         <h3>Headers:</h3>
         <pre>${JSON.stringify(JSON.parse(r.headers||'{}'),null,2)}</pre>
         ${r.body ? `<h3>Body:</h3><pre>${JSON.stringify(JSON.parse(r.body),null,2)}</pre>` : ''}
+        ${networkFpHtml}
       </div>
-    `).join('');
+    `;
+    }).join('');
 
     const fingerprintScript = getFingerprintingScript();
 
@@ -809,7 +1538,7 @@ app.get('/:uuid/logger', (req, res) => {
 
 // Content negotiation on '/logs'
 app.get('/logs', (req, res) => {
-  db.all(`SELECT method,url,headers,body,timestamp FROM logs ORDER BY id DESC`, (err, rows) => {
+  db.all(`SELECT method,url,headers,body,timestamp,network_fingerprint FROM logs ORDER BY id DESC`, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
 
     // JSON API
@@ -819,7 +1548,8 @@ app.get('/logs', (req, res) => {
         url: r.url,
         headers: JSON.parse(r.headers || '{}'),
         body: r.body ? JSON.parse(r.body) : {},
-        timestamp: r.timestamp
+        timestamp: r.timestamp,
+        network_fingerprint: r.network_fingerprint ? JSON.parse(r.network_fingerprint) : null
       }));
       return res.json(result);
     }
@@ -831,6 +1561,10 @@ app.get('/logs', (req, res) => {
         <h3>Headers:</h3>
         <pre style="white-space:pre-wrap;overflow-x:auto;">${JSON.stringify(JSON.parse(r.headers||'{}'),null,2)}</pre>
         ${r.body ? `<h3>Body:</h3><pre style="white-space:pre-wrap;overflow-x:auto;">${JSON.stringify(JSON.parse(r.body),null,2)}</pre>` : ''}
+        ${r.network_fingerprint ? `
+        <h3>🌐 Network Fingerprint:</h3>
+        <pre style="white-space:pre-wrap;overflow-x:auto;background:#2d2d2d;padding:10px;border-radius:4px;">${JSON.stringify(JSON.parse(r.network_fingerprint),null,2)}</pre>
+        ` : ''}
       </div>
     `).join('');
 
