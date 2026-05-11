@@ -150,6 +150,84 @@ const PRODUCTS = [
 ];
 const PRODUCT_MAP = Object.fromEntries(PRODUCTS.map((p) => [p.id, p]));
 
+/** Sec-Fetch-Dest values that indicate sub-resources (not top-level navigation). */
+const SUB_RESOURCE_DESTS = new Set(['image', 'script', 'style', 'font', 'iframe']);
+
+function extractScopeUuidFromUrl(urlPath) {
+  if (!urlPath) return null;
+  const m = String(urlPath).match(/^\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\//i);
+  return m ? m[1] : null;
+}
+
+/** Top-level navigation / full document loads — excludes image/script/style burst noise from timing. */
+function isDocumentNavigation(r) {
+  if (!r || r.method === 'WS') return false;
+  if (r.acceptDest === 'document') return true;
+  if (r.acceptMode === 'navigate' && (r.accept || '').includes('text/html')) return true;
+  if ((r.accept || '').includes('text/html') && !SUB_RESOURCE_DESTS.has(r.acceptDest)) return true;
+  if (/\.html?$/i.test(r.path)) return true;
+  return false;
+}
+
+/** Paths the shop HTML is supposed to pull as separate requests (for coverage scoring). */
+function expectedShopSubresourcePaths(uuid, documentPath) {
+  if (!uuid || !documentPath) return null;
+  const base = '/' + uuid + '/products';
+  const p = documentPath.replace(/\/$/, '');
+  if (p === base) {
+    return [
+      base + '/style.css',
+      base + '/app.js',
+      ...PRODUCTS.map((prod) => base + '/images/' + prod.id + '.svg')
+    ];
+  }
+  const rest = p.startsWith(base + '/') ? p.slice(base.length + 1) : '';
+  if (rest && !rest.includes('/') && PRODUCT_MAP[rest]) {
+    return [base + '/style.css', base + '/app.js', base + '/images/' + PRODUCT_MAP[rest].id + '.svg'];
+  }
+  return null;
+}
+
+/** Page category for navigation-graph scoring (login flow + shop). */
+function sessionPathKind(path, scopeUuid) {
+  if (!path) return 'other';
+  if (path === '/') return 'root';
+  if (!scopeUuid) return 'other';
+  const U = '/' + scopeUuid;
+  if (path === U + '/logger') return 'logger';
+  if (path === U + '/behavior') return 'behavior';
+  if (path === U + '/products') return 'shop_catalog';
+  if (path === U + '/login') return 'login';
+  if (path === U + '/account') return 'account';
+  if (path.startsWith(U + '/products/')) {
+    const seg = path.slice((U + '/products/').length);
+    if (seg.includes('/')) return 'other';
+    if (seg === 'style.css' || seg === 'app.js' || seg.startsWith('images')) return 'shop_asset';
+    if (PRODUCT_MAP[seg]) return 'shop_product';
+  }
+  return 'other';
+}
+
+function navigationTransitionAllowed(fromKind, toKind) {
+  if (fromKind === toKind) return true;
+  const edge = fromKind + '->' + toKind;
+  const ok = new Set([
+    'root->logger', 'root->behavior', 'root->shop_catalog', 'root->login', 'root->account',
+    'logger->behavior', 'logger->shop_catalog', 'logger->root', 'logger->login',
+    'behavior->logger', 'behavior->shop_catalog', 'behavior->root', 'behavior->login',
+    'shop_catalog->shop_product', 'shop_catalog->logger', 'shop_catalog->behavior', 'shop_catalog->root', 'shop_catalog->login',
+    'shop_product->shop_catalog', 'shop_product->shop_product', 'shop_product->logger', 'shop_product->behavior', 'shop_product->root', 'shop_product->login',
+    'login->account', 'login->shop_catalog', 'login->root', 'login->logger',
+    'account->shop_catalog', 'account->logger', 'account->behavior', 'account->root', 'account->login',
+    'account->shop_product',
+    'shop_product->account',
+    'behavior->account',
+    'other->root', 'other->logger', 'other->shop_catalog', 'other->behavior', 'other->login',
+    'shop_asset->root', 'shop_asset->other'
+  ]);
+  return ok.has(edge) || fromKind === 'other' || toKind === 'other' || fromKind === 'shop_asset' || toKind === 'shop_asset';
+}
+
 function renderProductSVG(p) {
   const safeEmoji = p.emoji || '🛒';
   const safeName = (p.name || '').replace(/[<>&]/g, '');
@@ -1172,6 +1250,20 @@ function getFingerprintingScript() {
     }
   };
   
+  var __bfIx = { pointerMoves: 0, keyDowns: 0, scrolls: 0, clicks: 0, touches: 0, finePointer: false, maxScrollY: 0 };
+  document.addEventListener('pointermove', function(ev){
+    __bfIx.pointerMoves++;
+    if (ev.width > 0 && ev.width < 2 && ev.height < 2) __bfIx.finePointer = true;
+  }, { passive: true, capture: true });
+  document.addEventListener('keydown', function() { __bfIx.keyDowns++; }, true);
+  document.addEventListener('scroll', function() {
+    __bfIx.scrolls++;
+    var y = window.scrollY || 0;
+    if (y > __bfIx.maxScrollY) __bfIx.maxScrollY = Math.round(y);
+  }, { passive: true, capture: true });
+  document.addEventListener('click', function() { __bfIx.clicks++; }, true);
+  document.addEventListener('touchstart', function() { __bfIx.touches++; }, { passive: true, capture: true });
+
   // Wait a bit for SharedWorker to respond before sending fingerprint
   setTimeout(() => {
     const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host);
@@ -1208,6 +1300,7 @@ function getFingerprintingScript() {
     ws.onopen=()=>{
       try{
         fp.devtools = detectBrowserDevTools();
+        fp.interactionTelemetry = __bfIx;
         ws.send(JSON.stringify({type:'fingerprint',data:fp}));
       }catch(_e){}
     };
@@ -1477,8 +1570,21 @@ function analyzeBehavior(logs) {
   logs.forEach((log) => {
     const fp = parseFP(log);
     const h = parseHeaders(log);
-    const ip = (fp && fp.ip) || h['x-forwarded-for'] || h['x-real-ip'] || 'unknown';
-    const ua = ((fp && fp.headerFingerprint && fp.headerFingerprint.userAgent) || h['user-agent'] || 'none').toString();
+    let wsPayload = null;
+    if (log.method === 'WS') {
+      try { wsPayload = JSON.parse(log.body || '{}'); } catch (_e) {}
+    }
+    const ip = (fp && fp.ip) ||
+      (wsPayload && wsPayload._wsMeta && wsPayload._wsMeta.clientIp) ||
+      (h['x-forwarded-for'] ? h['x-forwarded-for'].split(',')[0].trim() : null) ||
+      h['x-real-ip'] ||
+      'unknown';
+    const ua = (
+      (fp && fp.headerFingerprint && fp.headerFingerprint.userAgent) ||
+      (wsPayload && wsPayload.userAgent) ||
+      h['user-agent'] ||
+      'none'
+    ).toString();
     const key = ip + '||' + ua.substring(0, 80);
     if (!clients.has(key)) clients.set(key, { ip, ua, requests: [] });
     clients.get(key).requests.push({
@@ -1488,6 +1594,7 @@ function analyzeBehavior(logs) {
       url: log.url || '',
       path: (log.url || '').split('?')[0],
       referer: h.referer || h.referrer || null,
+      origin: h.origin || null,
       acceptDest: h['sec-fetch-dest'] || null,
       acceptMode: h['sec-fetch-mode'] || null,
       acceptSite: h['sec-fetch-site'] || null,
@@ -1498,7 +1605,8 @@ function analyzeBehavior(logs) {
       secChUa: h['sec-ch-ua'] || null,
       secChUaPlatform: h['sec-ch-ua-platform'] || null,
       upgradeInsecure: h['upgrade-insecure-requests'] || null,
-      networkHash: fp && fp.networkHash || null
+      networkHash: fp && fp.networkHash || null,
+      wsPayload
     });
   });
 
@@ -1527,51 +1635,102 @@ function analyzeBehavior(logs) {
     const browserStrong = browserConfidence >= 70;
     const browserMedium = browserConfidence >= 40;
 
-    // 1) Inter-request deltas (ms) and cadence stats
+    // -------- Navigation & timing (document loads isolated from asset noise) --------
+    const navReqs = reqs.filter(isDocumentNavigation);
     const deltas = [];
     for (let i = 1; i < reqs.length; i++) deltas.push(reqs[i].timeMs - reqs[i - 1].timeMs);
-    const mean = deltas.length ? deltas.reduce((a, b) => a + b, 0) / deltas.length : 0;
-    const variance = deltas.length ? deltas.reduce((a, b) => a + (b - mean) * (b - mean), 0) / deltas.length : 0;
-    const stdev = Math.sqrt(variance);
-    const cov = mean > 0 ? stdev / mean : 0; // coefficient of variation
+    const navDeltas = [];
+    for (let i = 1; i < navReqs.length; i++) navDeltas.push(navReqs[i].timeMs - navReqs[i - 1].timeMs);
 
-    // 2) Idle time (gaps > 5s)
+    const cadenceSource = navDeltas.length >= 2 ? navDeltas : deltas;
+    const cadenceMode = navDeltas.length >= 2 ? 'navigation-only gaps (between document loads)' : 'all-request gaps (not enough navigation samples)';
+
+    const mean = cadenceSource.length ? cadenceSource.reduce((a, b) => a + b, 0) / cadenceSource.length : 0;
+    const variance = cadenceSource.length ? cadenceSource.reduce((a, b) => a + (b - mean) * (b - mean), 0) / cadenceSource.length : 0;
+    const stdev = Math.sqrt(variance);
+    const cov = mean > 0 ? stdev / mean : 0;
+
+    let periodicitySuspicious = false;
+    let nearMedianFrac = null;
+    if (cadenceSource.length >= 4 && mean > 50) {
+      const sortedCad = cadenceSource.slice().sort((a, b) => a - b);
+      const med = sortedCad[Math.floor(sortedCad.length / 2)];
+      if (med > 80) {
+        const near = cadenceSource.filter((d) => d >= med * 0.88 && d <= med * 1.12).length;
+        nearMedianFrac = Number((near / cadenceSource.length).toFixed(2));
+        if (nearMedianFrac >= 0.72) periodicitySuspicious = true;
+      }
+    }
+
     const LONG_GAP_MS = 5000;
+    const LONG_IDLE_MS = 12000;
+    const navLongGaps = navDeltas.filter((d) => d > LONG_GAP_MS).length;
     const longGaps = deltas.filter((d) => d > LONG_GAP_MS).length;
     const maxGap = deltas.length ? Math.max.apply(null, deltas) : 0;
+    const navMaxGap = navDeltas.length ? Math.max.apply(null, navDeltas) : 0;
 
-    // 3) Parallel requests within 100ms windows
-    const PARALLEL_WIN_MS = 100;
+    // -------- Parallel bursts: same-URL hammer vs multi-asset fan-out --------
+    const PARALLEL_WIN_MS = 120;
     let parallelCount = 0;
     let burstWindows = 0;
+    let samePathBurstEvents = 0;
+    let diverseSubresourceBursts = 0;
     for (let i = 0; i < reqs.length;) {
       const end = reqs[i].timeMs + PARALLEL_WIN_MS;
-      let count = 1;
+      const bucket = [reqs[i]];
       let j = i + 1;
-      while (j < reqs.length && reqs[j].timeMs <= end) { count++; j++; }
-      if (count > 1) { parallelCount += count; burstWindows++; }
+      while (j < reqs.length && reqs[j].timeMs <= end) { bucket.push(reqs[j]); j++; }
+      if (bucket.length > 1) {
+        parallelCount += bucket.length;
+        burstWindows++;
+        const uniqPaths = new Set(bucket.map((r) => r.path)).size;
+        const allSub = bucket.every((r) => SUB_RESOURCE_DESTS.has(r.acceptDest));
+        if (allSub && uniqPaths >= 2) diverseSubresourceBursts++;
+        if (uniqPaths === 1 && bucket.length >= 3) samePathBurstEvents += bucket.length;
+      }
       i = j;
     }
 
     // 4) Resource loading: HTML doc requests followed within 5s by sub-resources
     const htmlReqs = reqs.filter((r) =>
-      (r.accept || '').includes('text/html') || r.acceptDest === 'document' || /\.html?$/.test(r.path)
+      (r.accept || '').includes('text/html') || r.acceptDest === 'document' || /\.html?$/i.test(r.path)
     );
-    const subResDestSet = new Set(['image', 'script', 'style', 'font', 'iframe']);
     let subResourceCount = 0;
     let pagesWithResources = 0;
     htmlReqs.forEach((p) => {
       const subs = reqs.filter((r) =>
-        r !== p && r.timeMs > p.timeMs && (r.timeMs - p.timeMs) < 5000 && subResDestSet.has(r.acceptDest)
+        r !== p && r.timeMs > p.timeMs && (r.timeMs - p.timeMs) < 5000 && SUB_RESOURCE_DESTS.has(r.acceptDest)
       );
       subResourceCount += subs.length;
       if (subs.length > 0) pagesWithResources++;
     });
 
-    // 5) Referer chain continuity
+    let scopeUuid = null;
+    for (const r of reqs) {
+      scopeUuid = extractScopeUuidFromUrl(r.path);
+      if (scopeUuid) break;
+    }
+
+    let resourceExpectedSlots = 0;
+    let resourceExpectedHits = 0;
+    htmlReqs.forEach((p) => {
+      const expected = expectedShopSubresourcePaths(scopeUuid, p.path);
+      if (!expected || !expected.length) return;
+      resourceExpectedSlots += expected.length;
+      const got = new Set(
+        reqs.filter((r) => r.timeMs > p.timeMs && (r.timeMs - p.timeMs) < 5000).map((r) => r.path)
+      );
+      expected.forEach((ep) => { if (got.has(ep)) resourceExpectedHits++; });
+    });
+    const shopResourceCoverage = resourceExpectedSlots > 0 ? resourceExpectedHits / resourceExpectedSlots : null;
+
+    // 5) Referer chain continuity + same-origin navigation expectations
     let refererPresent = 0;
     let refererMatches = 0;
     let refererMissing = 0;
+    let refererMismatch = 0;
+    let sameOriginNavDocs = 0;
+    let sameOriginNavMissingReferer = 0;
     const seenPaths = new Set();
     for (let i = 0; i < reqs.length; i++) {
       const r = reqs[i];
@@ -1581,8 +1740,13 @@ function analyzeBehavior(logs) {
         const u = parseUrl(r.referer);
         const refPath = u ? u.pathname : null;
         if (refPath && seenPaths.has(refPath)) refererMatches++;
+        else if (refPath) refererMismatch++;
       } else {
         refererMissing++;
+      }
+      if (isDocumentNavigation(r) && r.acceptSite === 'same-origin' && i > 0 && reqs[i - 1].method !== 'WS') {
+        sameOriginNavDocs++;
+        if (!r.referer) sameOriginNavMissingReferer++;
       }
       seenPaths.add(r.path);
     }
@@ -1592,72 +1756,149 @@ function analyzeBehavior(logs) {
     const entryPath = reqs[0] ? reqs[0].path : '';
     const visitedLogger = reqs.some((r) => /\/logger$/.test(r.path));
     const visitedRoot = reqs.some((r) => r.path === '/');
+    const visitedLogin = reqs.some((r) => scopeUuid && r.path === '/' + scopeUuid + '/login');
+    const visitedAccount = reqs.some((r) => scopeUuid && r.path === '/' + scopeUuid + '/account');
+
+    let invalidNavJumps = 0;
+    const navKindsTrace = [];
+    for (let i = 0; i < navReqs.length; i++) {
+      const k = sessionPathKind(navReqs[i].path, scopeUuid);
+      navKindsTrace.push(k);
+      if (i > 0 && !navigationTransitionAllowed(navKindsTrace[i - 1], k)) invalidNavJumps++;
+    }
+
+    // Client-side interaction telemetry (latest WS fingerprint in this session)
+    let ix = null;
+    for (let i = reqs.length - 1; i >= 0; i--) {
+      const pl = reqs[i].wsPayload;
+      if (pl && pl.interactionTelemetry) { ix = pl.interactionTelemetry; break; }
+    }
+    const ixTotal = ix
+      ? (ix.pointerMoves || 0) + (ix.keyDowns || 0) + (ix.scrolls || 0) + (ix.clicks || 0) + (ix.touches || 0)
+      : 0;
 
     // Cadence percentiles (for evidence display)
-    const sortedDeltas = deltas.slice().sort((a, b) => a - b);
+    const sortedDeltas = cadenceSource.slice().sort((a, b) => a - b);
     const pct = (p) => sortedDeltas.length ? sortedDeltas[Math.min(sortedDeltas.length - 1, Math.floor(sortedDeltas.length * p))] : 0;
     const minGap = sortedDeltas[0] || 0;
     const p50Gap = pct(0.5);
     const p95Gap = pct(0.95);
 
     // -------- Scoring (each 0..100 where 100 = strongly bot-like) --------
-    // Each signal also produces an `evidence` object describing WHY it scored
-    // that way, and a `reason` string describing the rule that fired.
 
     let cadenceScore, cadenceLabel, cadenceReason;
-    if (reqs.length < 3) { cadenceLabel = 'Too few requests to score'; cadenceScore = 30; cadenceReason = 'Need ≥3 requests to compute timing variability'; }
-    else if (cov < 0.2) { cadenceLabel = 'Suspiciously uniform timing'; cadenceScore = 90; cadenceReason = 'CoV < 0.2 → bot-uniform'; }
-    else if (cov < 0.5) { cadenceLabel = 'Low timing variability'; cadenceScore = 65; cadenceReason = 'CoV < 0.5 → low variability'; }
-    else if (cov > 3.0) { cadenceLabel = 'Bursty (possible scripted bursts)'; cadenceScore = 55; cadenceReason = 'CoV > 3.0 → very bursty'; }
-    else { cadenceLabel = 'Human-like timing variability'; cadenceScore = 15; cadenceReason = '0.5 ≤ CoV ≤ 3.0 → human-variable'; }
+    if (cadenceSource.length < 2) {
+      cadenceLabel = 'Too few timing samples'; cadenceScore = 28; cadenceReason = 'Need ≥2 gaps in the cadence sample';
+    } else if (periodicitySuspicious && cov < 1.2) {
+      cadenceLabel = 'Mechanical rhythm (many gaps near median)';
+      cadenceScore = 72;
+      cadenceReason = (nearMedianFrac * 100).toFixed(0) + '% of gaps fall within ±12% of median → fixed-delay scripting?';
+    } else if (cov < 0.18) { cadenceLabel = 'Suspiciously uniform timing'; cadenceScore = 90; cadenceReason = 'CoV < 0.18 → metronome-like'; }
+    else if (cov < 0.42) { cadenceLabel = 'Low timing variability'; cadenceScore = 62; cadenceReason = 'CoV < 0.42 → low variability'; }
+    else if (cov > 3.0) { cadenceLabel = 'Bursty (possible scripted bursts)'; cadenceScore = 52; cadenceReason = 'CoV > 3.0 → heavy-tailed / bursty'; }
+    else { cadenceLabel = 'Human-like timing variability'; cadenceScore = 14; cadenceReason = '0.42 ≤ CoV ≤ 3.0 and no median-clustering'; }
+
     const cadenceEvidence = {
+      'cadence basis': cadenceMode,
+      'navigation samples': navReqs.length + ' doc load(s)',
       'mean gap': mean ? Math.round(mean) + ' ms' : '—',
       'stdev': stdev ? Math.round(stdev) + ' ms' : '—',
       'CoV (stdev/mean)': mean > 0 ? Number(cov.toFixed(3)) : '—',
+      '% gaps near median (±12%)': nearMedianFrac != null ? (nearMedianFrac * 100).toFixed(0) + '%' : 'n/a',
       'min / p50 / p95 / max': minGap + ' / ' + p50Gap + ' / ' + p95Gap + ' / ' + maxGap + ' ms',
-      'sample size': deltas.length + ' gap(s)',
+      'sample gaps': cadenceSource.length,
       'rule that fired': cadenceReason
     };
 
     let idleScore, idleLabel, idleReason;
-    if (reqs.length < 2) { idleLabel = 'Single request'; idleScore = 35; idleReason = 'Not enough data'; }
-    else if (longGaps === 0 && mean < 1000) { idleLabel = 'No think-time detected'; idleScore = 85; idleReason = 'No gaps > 5s AND mean gap < 1s'; }
-    else if (longGaps === 0) { idleLabel = 'No pauses (>5s) but spaced'; idleScore = 45; idleReason = 'No gaps > 5s but reqs are slow-paced'; }
-    else { idleLabel = longGaps + ' pause(s) >5s present'; idleScore = 10; idleReason = 'Has ≥1 natural pause > 5s'; }
+    if (reqs.length < 2) { idleLabel = 'Single request'; idleScore = 34; idleReason = 'Not enough data'; }
+    else if (navLongGaps === 0 && mean < 900 && reqs.length >= 4) {
+      idleLabel = 'Rapid fire between navigations (no >5s pauses)';
+      idleScore = 78;
+      idleReason = 'Navigation gaps never exceed 5s with active session';
+    } else if (navMaxGap > LONG_IDLE_MS || navLongGaps >= 2) {
+      idleLabel = 'Natural idle between pages (≥' + (navLongGaps || 0) + ' × >5s nav gap)';
+      idleScore = 8;
+      idleReason = 'Think-time visible between document loads';
+    } else if (longGaps === 0 && mean < 1000) { idleLabel = 'No think-time in request stream'; idleScore = 72; idleReason = 'No gaps > 5s AND mean gap < 1s (all requests)'; }
+    else if (longGaps === 0) { idleLabel = 'No long pauses (>5s) but spaced'; idleScore = 42; idleReason = 'No gaps > 5s but mean gap ≥ 1s'; }
+    else { idleLabel = longGaps + ' long pause(s) >5s in full stream'; idleScore = 12; idleReason = 'Has ≥1 pause > 5s between any requests'; }
+
+    if (browserStrong && reqs.length >= 5 && ix && ixTotal < 3) {
+      idleScore = Math.min(100, idleScore + 18);
+      idleReason += ' · Fingerprint reports almost no pointer/keyboard/scroll activity despite many HTTP reqs';
+    }
+    if (ix && ixTotal >= 12 && idleScore > 35) {
+      idleScore = Math.max(0, idleScore - 22);
+      idleReason += ' · Rich client interaction telemetry (' + ixTotal + ' events) supports human presence';
+    }
+
     const longGapValues = deltas.filter((d) => d > LONG_GAP_MS).map((d) => (d / 1000).toFixed(1) + 's');
     const idleEvidence = {
-      'gaps longer than 5s': longGaps,
+      'nav gaps >5s': navLongGaps,
+      'max navigation gap': navMaxGap ? (navMaxGap / 1000).toFixed(1) + 's' : '—',
+      'gaps longer than 5s (all reqs)': longGaps,
       'their durations': longGapValues.length ? longGapValues.slice(0, 10).join(', ') : '(none)',
-      'longest gap': maxGap ? (maxGap / 1000).toFixed(1) + 's' : '—',
+      'interaction events (WS telemetry)': ix ? ixTotal : '(no telemetry)',
+      'pointer / key / scroll / click': ix ? ((ix.pointerMoves || 0) + ' / ' + (ix.keyDowns || 0) + ' / ' + (ix.scrolls || 0) + ' / ' + (ix.clicks || 0)) : '—',
       'rule that fired': idleReason
     };
 
     let parallelScore, parallelLabel, parallelReason;
     if (parallelCount === 0) {
       parallelLabel = 'No concurrent requests';
-      parallelScore = browserStrong ? 15 : 30;
-      parallelReason = browserStrong ? 'No bursts + strong browser headers → normal navigation' : 'No concurrent requests';
+      parallelScore = browserStrong ? 12 : 26;
+      parallelReason = browserStrong ? 'Sequential requests + strong browser profile' : 'No overlapping requests in ' + PARALLEL_WIN_MS + 'ms windows';
+    } else if (diverseSubresourceBursts > 0 || (subResourceCount >= 4 && parallelCount > 3)) {
+      parallelLabel = 'Concurrent bursts match browser asset fan-out';
+      parallelScore = 8;
+      parallelReason = 'Parallel window contains diverse sub-resources (typical page load)';
+    } else if (samePathBurstEvents >= 6) {
+      parallelLabel = 'Same URL hammered in parallel';
+      parallelScore = 82;
+      parallelReason = '≥3 concurrent requests to the same path — rare for humans, common for scrapers';
     } else if (subResourceCount > 0 && parallelCount > 2) {
-      parallelLabel = 'Concurrent fetches (sub-resources)';
-      parallelScore = 10;
-      parallelReason = 'Concurrent reqs accompanied by sub-resource fetches → browser';
+      parallelLabel = 'Concurrent fetches with sub-resources';
+      parallelScore = 12;
+      parallelReason = 'Parallelism accompanied by CSS/JS/image traffic';
     } else {
       parallelLabel = parallelCount + ' concurrent req(s) in ' + burstWindows + ' burst(s)';
-      parallelScore = 70;
-      parallelReason = 'Concurrent reqs without sub-resource pattern → scripted';
+      parallelScore = 64;
+      parallelReason = 'Concurrent bursts without obvious browser asset pattern';
     }
     const parallelEvidence = {
-      'concurrent requests': parallelCount,
-      'burst windows (100 ms)': burstWindows,
+      'concurrent request events': parallelCount,
+      'burst windows': burstWindows,
       'window size': PARALLEL_WIN_MS + ' ms',
+      'diverse sub-resource bursts': diverseSubresourceBursts,
+      'same-path burst weight': samePathBurstEvents,
       'rule that fired': parallelReason
-    };
+      };
 
     let resourceScore, resourceLabel, resourceReason;
-    if (htmlReqs.length === 0) {
+    if (shopResourceCoverage != null) {
+      const pctC = Math.round(shopResourceCoverage * 100);
+      if (shopResourceCoverage >= 0.88) {
+        resourceLabel = 'Shop template: expected assets loaded (' + pctC + '% coverage)';
+        resourceScore = 6;
+        resourceReason = 'Server-defined CSS/JS/SVG list for catalog/detail pages mostly satisfied';
+      } else if (shopResourceCoverage < 0.32 && !browserStrong) {
+        resourceLabel = 'Shop HTML but assets largely missing (' + pctC + '% coverage)';
+        resourceScore = 92;
+        resourceReason = 'Fetched catalog/product HTML without the linked sub-resources — classic agent pattern';
+      } else if (shopResourceCoverage < 0.55) {
+        resourceLabel = 'Partial shop asset coverage (' + pctC + '%)';
+        resourceScore = browserStrong ? 38 : 68;
+        resourceReason = 'Some expected assets missing — incomplete browser or selective fetcher';
+      } else {
+        resourceLabel = 'Shop assets mostly present (' + pctC + '% coverage)';
+        resourceScore = browserMedium ? 22 : 15;
+        resourceReason = 'Majority of template assets loaded';
+      }
+    } else if (htmlReqs.length === 0) {
       if (browserStrong) {
         resourceLabel = 'No HTML page hits, but browser-headers present';
-        resourceScore = 40;
+        resourceScore = 38;
         resourceReason = 'Endpoint-only hits but headers are browser-like (XHR/fetch from a SPA?)';
       } else {
         resourceLabel = 'No HTML page hits (endpoint-only)';
@@ -1667,11 +1908,11 @@ function analyzeBehavior(logs) {
     } else if (subResourceCount === 0) {
       if (browserStrong) {
         resourceLabel = 'No sub-resources, but headers strongly browser-like';
-        resourceScore = 20;
-        resourceReason = 'Zero sub-resources is ambiguous because the page may have none (inline CSS/JS) — headers indicate real browser';
+        resourceScore = 18;
+        resourceReason = 'Zero sub-resources is ambiguous (inline assets) — headers indicate real browser';
       } else if (browserMedium) {
         resourceLabel = 'No sub-resources (browser headers partial)';
-        resourceScore = 55;
+        resourceScore = 52;
         resourceReason = 'Mixed signal: some browser headers but no resource follow-ups';
       } else {
         resourceLabel = 'HTML loaded but NO sub-resources fetched';
@@ -1680,11 +1921,11 @@ function analyzeBehavior(logs) {
       }
     } else if (subResourceCount < 3) {
       resourceLabel = 'Few sub-resources (' + subResourceCount + ')';
-      resourceScore = 45;
+      resourceScore = 42;
       resourceReason = '<3 sub-resources fetched after HTML';
     } else {
       resourceLabel = subResourceCount + ' sub-resources loaded';
-      resourceScore = 10;
+      resourceScore = 9;
       resourceReason = '≥3 sub-resources → typical browser load';
     }
     const destsSeen = Array.from(new Set(reqs.map((r) => r.acceptDest).filter(Boolean)));
@@ -1692,6 +1933,7 @@ function analyzeBehavior(logs) {
       'HTML page hits': htmlReqs.length,
       'sub-resources within 5s': subResourceCount,
       'pages with resources': pagesWithResources,
+      'shop template coverage': shopResourceCoverage != null ? (Math.round(shopResourceCoverage * 100) + '% (' + resourceExpectedHits + '/' + resourceExpectedSlots + ' expected paths)') : 'n/a (not on shop templates)',
       'Sec-Fetch-Dest values seen': destsSeen.length ? destsSeen.join(', ') : '(none)',
       'browser-signature damping applied': browserStrong ? 'yes (high confidence)' : browserMedium ? 'partial' : 'no',
       'rule that fired': resourceReason
@@ -1702,56 +1944,78 @@ function analyzeBehavior(logs) {
       refererLabel = 'Single request';
       refererScore = 30;
       refererReason = 'Cannot evaluate a chain from a single request';
-    } else if (refererMissing > 0 && (refererMissing / Math.max(1, reqs.length - 1)) > 0.5) {
+    } else if (sameOriginNavDocs >= 2 && (sameOriginNavMissingReferer / sameOriginNavDocs) > 0.45) {
+      refererLabel = 'Same-origin navigations missing Referer';
+      refererScore = 76;
+      refererReason = 'Modern same-origin transitions usually carry Referer — many absent here';
+    } else if (refererMissing > 0 && (refererMissing / Math.max(1, reqs.length - 1)) > 0.55) {
       refererLabel = refererMissing + ' missing referer(s)';
-      refererScore = 80;
-      refererReason = '>50% of follow-up requests have no Referer header';
+      refererScore = 78;
+      refererReason = '>55% of follow-up requests have no Referer header';
+    } else if (refererPresent > 0 && (refererMatches / refererPresent) < 0.35 && refererMismatch / refererPresent > 0.3) {
+      refererLabel = 'Referer rarely matches session history';
+      refererScore = 72;
+      refererReason = 'Referer paths mostly not previously visited in this session';
     } else if (refererPresent > 0 && (refererMatches / refererPresent) < 0.4) {
       refererLabel = 'Referer chain has gaps (' + refererMatches + '/' + refererPresent + ' match)';
-      refererScore = 75;
+      refererScore = 70;
       refererReason = '<40% of Referers point to a previously-visited URL';
     } else if (refererPresent > 0) {
       refererLabel = 'Plausible referer chain (' + refererMatches + '/' + refererPresent + ')';
-      refererScore = 15;
-      refererReason = 'Most Referers point to previously-visited URLs';
+      refererScore = 14;
+      refererReason = 'Most Referers align with prior session paths';
     } else {
       refererLabel = 'No referer headers';
-      refererScore = 65;
+      refererScore = 62;
       refererReason = 'Zero Referer headers across the session';
     }
     const refererEvidence = {
       'follow-up requests (post-first)': Math.max(0, reqs.length - 1),
       'with Referer header': refererPresent,
       'matching a previously-visited path': refererMatches,
+      'referer path NOT in session': refererMismatch,
       'missing Referer header': refererMissing,
+      'same-origin document navigations': sameOriginNavDocs,
+      'same-origin docs missing referer': sameOriginNavMissingReferer,
       'match ratio': refererPresent > 0 ? (refererMatches / refererPresent * 100).toFixed(0) + '%' : 'n/a',
       'rule that fired': refererReason
     };
 
     let depthScore, depthLabel, depthReason;
-    if (uniquePaths === 1) {
+    if (invalidNavJumps > 0) {
+      depthLabel = invalidNavJumps + ' implausible navigation jump(s)';
+      depthScore = Math.min(95, 38 + invalidNavJumps * 14);
+      depthReason = 'Document → document transitions violate the expected site graph (shop, login, logger, behavior)';
+    } else if (uniquePaths === 1) {
       depthLabel = 'Visited 1 path only — direct hit';
-      depthScore = browserStrong ? 45 : 75;
-      depthReason = browserStrong ? 'Single path but real-browser headers (user pasted URL?)' : 'Direct hit on a single endpoint, no navigation';
-    } else if (visitedLogger && !visitedRoot) {
-      depthLabel = 'Skipped landing, hit logger directly';
-      depthScore = browserStrong ? 30 : 60;
-      depthReason = browserStrong ? 'Pasted-URL navigation in a real browser is normal' : 'Did not visit landing page before target URL';
-    } else if (uniquePaths < 3) {
+      depthScore = browserStrong ? 42 : 72;
+      depthReason = browserStrong ? 'Single path but strong browser fingerprint' : 'Direct hit on a single endpoint';
+    } else if ((visitedLogger || visitedAccount) && !visitedRoot && !visitedLogin) {
+      depthLabel = 'Deep-linked into scoped area (no / or login)';
+      depthScore = browserStrong ? 26 : 52;
+      depthReason = browserStrong ? 'Typical when following a pasted monitoring URL' : 'Skipped public landing & login affordances';
+    } else if (uniquePaths < 3 && !visitedLogin) {
       depthLabel = 'Shallow navigation (' + uniquePaths + ' paths)';
-      depthScore = 35;
-      depthReason = '<3 unique paths visited';
+      depthScore = 32;
+      depthReason = '<3 unique paths and no login step observed';
+    } else if (visitedLogin && visitedAccount && visitedLogger) {
+      depthLabel = 'Login → account → logger flow observed';
+      depthScore = 12;
+      depthReason = 'Matches a realistic authenticated exploration pattern';
     } else {
       depthLabel = 'Explored ' + uniquePaths + ' paths';
-      depthScore = 20;
-      depthReason = '≥3 unique paths visited';
+      depthScore = 18;
+      depthReason = 'Breadth of navigation within scope';
     }
-    const visitedPathSamples = Array.from(new Set(reqs.map((r) => r.path))).slice(0, 8);
+    const visitedPathSamples = Array.from(new Set(reqs.map((r) => r.path))).slice(0, 12);
     const depthEvidence = {
       'unique paths': uniquePaths,
+      'navigation sequence kinds': navKindsTrace.join(' → ') || '(none)',
+      'implausible jumps': invalidNavJumps,
       'sample paths': visitedPathSamples.join(', '),
       'entry path': entryPath,
       'visited / (root)': visitedRoot ? 'yes' : 'no',
+      'visited /login /account': (visitedLogin ? 'login ' : '') + (visitedAccount ? 'account' : ''),
       'visited a /logger path': visitedLogger ? 'yes' : 'no',
       'browser-signature damping applied': browserStrong ? 'yes (high confidence)' : 'no',
       'rule that fired': depthReason
@@ -1793,23 +2057,41 @@ function analyzeBehavior(logs) {
       signals,
       stats: {
         deltas,
+        navDeltas,
+        sparklineDeltas: navDeltas.length >= 2 ? navDeltas : cadenceSource,
+        cadenceMode,
+        navigationSamples: navReqs.length,
         meanGapMs: Math.round(mean),
         stdevGapMs: Math.round(stdev),
         coefficientOfVariation: Number(cov.toFixed(3)),
+        periodicityNearMedianFrac: nearMedianFrac,
         longGapsCount: longGaps,
+        navLongGapsCount: navLongGaps,
         maxGapMs: maxGap,
         parallelCount,
         burstWindows,
+        diverseSubresourceBursts,
+        samePathBurstEvents,
+        parallelWindowMs: PARALLEL_WIN_MS,
         subResourceCount,
         pagesWithResources,
+        shopResourceCoverage,
+        resourceExpectedHits,
+        resourceExpectedSlots,
         htmlReqCount: htmlReqs.length,
         refererPresent,
         refererMatches,
+        refererMismatch,
         refererMissing,
+        sameOriginNavDocs,
+        sameOriginNavMissingReferer,
         uniquePaths,
+        invalidNavJumps,
         entryPath,
         visitedLogger,
-        visitedRoot
+        visitedRoot,
+        visitedLogin,
+        visitedAccount
       },
       sample: reqs.slice(0, 40).map((r) => ({
         t: r.timestamp,
@@ -1849,6 +2131,77 @@ function renderDeltaSparkline(deltas, width, height) {
 // ============================================================
 // IMPORTANT: register the literal sub-paths BEFORE /:uuid/products/:productId
 // otherwise Express will treat 'style.css' / 'app.js' / 'images' as a product id.
+
+// Minimal login / account flow (session-depth & navigation-graph signal)
+app.get('/:uuid/login', (req, res) => {
+  if (!LOGGER_UUIDS.includes(req.params.uuid)) return res.redirect('/');
+  const u = req.params.uuid;
+  res.set('Cache-Control', 'no-store');
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Login — Demo</title>
+  <link rel="stylesheet" href="/${u}/products/style.css">
+</head>
+<body>
+  <div class="container">
+    <h1>🔐 Demo login</h1>
+    <p class="subtitle">No real auth — POST issues a cookie and redirects to <code>/account</code> for navigation-graph testing.</p>
+    <form method="POST" action="/${u}/login" style="max-width:360px;margin:20px 0;">
+      <input name="user" autocomplete="username" placeholder="Username" style="display:block;width:100%;padding:10px;margin-bottom:10px;border-radius:6px;border:1px solid #555;background:#2d2d2d;color:#e0e0e0;">
+      <input name="pass" type="password" autocomplete="current-password" placeholder="Password" style="display:block;width:100%;padding:10px;margin-bottom:14px;border-radius:6px;border:1px solid #555;background:#2d2d2d;color:#e0e0e0;">
+      <button type="submit" class="nav-link" style="border:none;cursor:pointer;width:100%;">Sign in</button>
+    </form>
+    <div style="margin-top:16px;">
+      <a href="/${u}/logger" class="nav-link" style="background:#34495e;">← Logger</a>
+      <a href="/${u}/products" class="nav-link" style="background:#16a085;">🛍️ Shop</a>
+    </div>
+  </div>
+  <script src="/${u}/products/app.js"></script>
+</body>
+</html>`);
+});
+
+app.post('/:uuid/login', (req, res) => {
+  if (!LOGGER_UUIDS.includes(req.params.uuid)) return res.redirect('/');
+  const u = req.params.uuid;
+  const token = crypto.randomBytes(12).toString('hex');
+  res.setHeader('Set-Cookie', 'demo_session=' + token + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600');
+  res.redirect('/' + u + '/account');
+});
+
+app.get('/:uuid/account', (req, res) => {
+  if (!LOGGER_UUIDS.includes(req.params.uuid)) return res.redirect('/');
+  const u = req.params.uuid;
+  const cookieHeader = req.headers.cookie || '';
+  const m = cookieHeader.match(/(?:^|;\s*)demo_session=([^;]+)/);
+  const token = m ? decodeURIComponent(m[1]).substring(0, 12) + '…' : '(no cookie — open /login first)';
+  res.set('Cache-Control', 'no-store');
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Account — Demo</title>
+  <link rel="stylesheet" href="/${u}/products/style.css">
+</head>
+<body>
+  <div class="container">
+    <h1>👤 Demo account</h1>
+    <p class="subtitle">Session cookie prefix: <code>${token}</code></p>
+    <p style="color:#b0b0b0;">You completed the login affordance. Continue to the logger or shop so the analyzer sees a plausible journey.</p>
+    <div style="margin-top:18px;">
+      <a href="/${u}/logger" class="nav-link">📋 Logger</a>
+      <a href="/${u}/products" class="nav-link" style="background:#16a085;">🛍️ Shop</a>
+      <a href="/${u}/behavior" class="nav-link" style="background:#8e44ad;">🧠 Behavior</a>
+    </div>
+  </div>
+  <script src="/${u}/products/app.js"></script>
+</body>
+</html>`);
+});
 
 // External stylesheet — triggers Sec-Fetch-Dest: style
 app.get('/:uuid/products/style.css', (req, res) => {
@@ -2164,6 +2517,7 @@ app.get('/:uuid/logger', (req, res) => {
   <div style="text-align: center; margin-bottom: 30px;">
     <a href="/${req.params.uuid}/behavior" class="nav-link" style="background-color: #8e44ad;">🧠 Behavioral Analysis</a>
     <a href="/${req.params.uuid}/products" class="nav-link" style="background-color: #16a085;">🛍️ Open Shop</a>
+    <a href="/${req.params.uuid}/login" class="nav-link" style="background-color: #6c3483;">🔐 Demo login</a>
     <a href="/objects" class="nav-link">🔍 Browser Objects Explorer</a>
     <a href="/logs" class="nav-link">📋 View Logs API</a>
     <button id="clearLogsBtn" style="background-color: #dc3545; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin: 10px 5px; cursor: pointer; font-size: 14px; transition: background-color 0.3s;">🗑️ Clear Logs</button>
@@ -2380,7 +2734,7 @@ app.get('/:uuid/behavior', (req, res) => {
 
             <div style="margin-bottom:15px;">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-                <strong style="color:#e0e0e0;font-size:13px;">Inter-request gaps (ms)</strong>
+                <strong style="color:#e0e0e0;font-size:13px;">Timing gaps (ms) — ${stats.cadenceMode || 'all requests'}</strong>
                 <span style="font-size:10px;color:#7f8c8d;">
                   <span style="display:inline-block;width:8px;height:8px;background:#ff6b6b;border-radius:2px;"></span> &lt;100ms
                   <span style="display:inline-block;width:8px;height:8px;background:#f39c12;border-radius:2px;margin-left:8px;"></span> &lt;1s
@@ -2388,8 +2742,8 @@ app.get('/:uuid/behavior', (req, res) => {
                   <span style="display:inline-block;width:8px;height:8px;background:#28a745;border-radius:2px;margin-left:8px;"></span> ≥5s
                 </span>
               </div>
-              ${renderDeltaSparkline(stats.deltas, 720, 70)}
-              <div style="font-size:10px;color:#7f8c8d;margin-top:4px;">Each bar = one inter-request gap, sorted in time order. Uniform heights ⇒ metronome (bot). Mixed heights with tall greens ⇒ human think-time.</div>
+              ${renderDeltaSparkline(stats.sparklineDeltas || stats.deltas, 720, 70)}
+              <div style="font-size:10px;color:#7f8c8d;margin-top:4px;">Bars show gaps used for cadence (preferring <strong>navigation-only</strong> intervals). Uniform towers + low CoV ⇒ bot; tall greens between pages ⇒ human think-time.</div>
             </div>
 
             ${browserSignatureHtml}
@@ -2947,6 +3301,20 @@ app.get('/logs', (req, res) => {
     }
   };
   
+  var __bfIx = { pointerMoves: 0, keyDowns: 0, scrolls: 0, clicks: 0, touches: 0, finePointer: false, maxScrollY: 0 };
+  document.addEventListener('pointermove', function(ev){
+    __bfIx.pointerMoves++;
+    if (ev.width > 0 && ev.width < 2 && ev.height < 2) __bfIx.finePointer = true;
+  }, { passive: true, capture: true });
+  document.addEventListener('keydown', function() { __bfIx.keyDowns++; }, true);
+  document.addEventListener('scroll', function() {
+    __bfIx.scrolls++;
+    var y = window.scrollY || 0;
+    if (y > __bfIx.maxScrollY) __bfIx.maxScrollY = Math.round(y);
+  }, { passive: true, capture: true });
+  document.addEventListener('click', function() { __bfIx.clicks++; }, true);
+  document.addEventListener('touchstart', function() { __bfIx.touches++; }, { passive: true, capture: true });
+
   // Wait a bit for SharedWorker to respond before sending fingerprint
   setTimeout(() => {
     const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host);
@@ -2983,6 +3351,7 @@ app.get('/logs', (req, res) => {
     ws.onopen=()=>{
       try{
         fp.devtools = detectBrowserDevTools();
+        fp.interactionTelemetry = __bfIx;
         ws.send(JSON.stringify({type:'fingerprint',data:fp}));
       }catch(_e){}
     };
@@ -3001,16 +3370,30 @@ ${script}
 
 // WebSocket server for fingerprint messages
 const wss = new WebSocket.Server({ server });
-wss.on('connection', ws => {
+wss.on('connection', (ws, req) => {
+  const wsClientIp = (() => {
+    const h = req.headers || {};
+    if (h['cf-connecting-ip']) return h['cf-connecting-ip'].split(',')[0].trim();
+    if (h['x-forwarded-for']) return h['x-forwarded-for'].split(',')[0].trim();
+    if (h['x-real-ip']) return h['x-real-ip'].split(',')[0].trim();
+    return req.socket?.remoteAddress || 'unknown';
+  })();
   ws.on('message', message => {
     try {
       const msg = JSON.parse(message);
       if (msg.type === 'fingerprint') {
-        const { origin, ...data } = msg.data;
+        const data = Object.assign({}, msg.data);
+        const origin = data.origin || '/';
+        data._wsMeta = { clientIp: wsClientIp, ts: new Date().toISOString() };
         const ts = new Date().toISOString();
+        const nf = JSON.stringify({
+          ip: wsClientIp,
+          userAgent: data.userAgent,
+          fromWebSocket: true
+        });
         db.run(
-          `INSERT INTO logs(method,url,headers,body,timestamp) VALUES(?,?,?,?,?)`,
-          ['WS', origin, '{}', JSON.stringify(data), ts]
+          `INSERT INTO logs(method,url,headers,body,timestamp,network_fingerprint) VALUES(?,?,?,?,?,?)`,
+          ['WS', origin, '{}', JSON.stringify(data), ts, nf]
         );
       }
     } catch (e) {
