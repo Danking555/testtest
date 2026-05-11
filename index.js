@@ -127,6 +127,120 @@ setInterval(() => {
   regenerateLoggerUUIDs();
 }, UUID_REGEN_INTERVAL);
 
+// ============================================================
+// Demo "Shop" — drives the Resource-Loading behavioral signal
+// ============================================================
+// Each page intentionally pulls EXTERNAL sub-resources (CSS, JS, SVG image)
+// so a real browser produces image/script/style fetches with the
+// corresponding Sec-Fetch-Dest header; an agent that only fetches the
+// HTML target will not. This is exactly what the analyzer measures.
+const PRODUCTS = [
+  { id: 'quantum-mug',     name: 'Quantum Coffee Mug',  price: 24.99,  color: '#e74c3c', emoji: '☕',  tagline: 'Schrödinger-approved',
+    description: 'Both full and empty until you observe it. Perfect for indecisive mornings — collapse the wavefunction with every sip. Microwave-safe. Universe-safe not guaranteed.' },
+  { id: 'nebula-notebook', name: 'Nebula Notebook',     price: 18.50,  color: '#3498db', emoji: '📓', tagline: 'Acid-free, stardust-coated',
+    description: '120 pages of high-grain interstellar paper, gently misted with the dust of long-dead suns. Each page accepts ink with the calm dignity of a black hole accepting matter.' },
+  { id: 'plasma-pen',      name: 'Plasma Pen',          price: 12.00,  color: '#9b59b6', emoji: '🖊️', tagline: 'Writes on any plasma surface',
+    description: 'Glows in the dark, the light, and the in-between. Refillable with standard sun cores. Comes with a lifetime warranty (yours, not the pen\u2019s).' },
+  { id: 'hologram-hoodie', name: 'Hologram Hoodie',     price: 89.99,  color: '#1abc9c', emoji: '👕', tagline: '4D-printed, machine-washable',
+    description: 'Visible only from your own light cone. Comfortable at all temperatures from 4 K to 400 K. Adjustable existence: low-key, casual, or strictly observed.' },
+  { id: 'antigrav-boots',  name: 'Anti-Gravity Boots',  price: 199.99, color: '#f39c12', emoji: '👢', tagline: '0.5 g lighter than air',
+    description: 'Walks the user along, mostly. Soles charged inductively. Includes tether for safety. Cannot be worn while flying, holding the moon, or in casual elevators.' },
+  { id: 'telepathy-set',   name: 'Telepathy Headset',   price: 349.00, color: '#e91e63', emoji: '🎧', tagline: 'BYOB (bring your own brainwaves)',
+    description: 'High-bandwidth wireless thought-streaming. Compatible with most mammals, several birds, and one well-trained octopus. Subscription required for thoughts above 7 Hz.' }
+];
+const PRODUCT_MAP = Object.fromEntries(PRODUCTS.map((p) => [p.id, p]));
+
+function renderProductSVG(p) {
+  const safeEmoji = p.emoji || '🛒';
+  const safeName = (p.name || '').replace(/[<>&]/g, '');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="${p.color}"/>
+      <stop offset="100%" stop-color="#1a1a1a"/>
+    </linearGradient>
+  </defs>
+  <rect width="400" height="400" rx="12" fill="url(#bg)"/>
+  <text x="200" y="250" text-anchor="middle" font-size="180" font-family="Apple Color Emoji, Segoe UI Emoji, sans-serif">${safeEmoji}</text>
+  <text x="200" y="370" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-family="-apple-system, Helvetica, sans-serif" font-size="22" font-weight="bold">${safeName}</text>
+</svg>`;
+}
+
+function renderProductsCSS() {
+  return `
+/* Demo shop stylesheet — served as a real sub-resource on every page load. */
+body { background:#1a1a1a; color:#e0e0e0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; margin:0; padding:20px; }
+.container { max-width:1100px; margin:0 auto; }
+h1 { color:#fff; margin:0 0 6px 0; }
+.subtitle { color:#95a5a6; margin-bottom:24px; font-size:13px; }
+.nav-link { display:inline-block; background:#007bff; color:white; padding:8px 16px; text-decoration:none; border-radius:6px; margin:0 4px 0 0; font-size:13px; transition:background-color .2s; }
+.nav-link:hover { background:#0056b3; }
+.product-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:20px; }
+.product-card { background:#2d2d2d; border:1px solid #555; border-radius:8px; overflow:hidden; transition:transform .2s,box-shadow .2s,border-color .2s; }
+.product-card:hover { transform:translateY(-3px); box-shadow:0 6px 14px rgba(0,0,0,0.4); border-color:#4a90e2; }
+.product-card img { width:100%; aspect-ratio:1/1; display:block; background:#1a1a1a; }
+.product-card .meta { padding:12px 14px; }
+.product-card .name { font-size:14px; color:#e0e0e0; margin-bottom:4px; font-weight:bold; }
+.product-card .tagline { font-size:11px; color:#95a5a6; margin-bottom:8px; font-style:italic; }
+.product-card .price { font-size:16px; color:#4a90e2; font-weight:bold; margin-bottom:10px; }
+.product-card a.view { display:block; text-align:center; background:#007bff; color:white; padding:7px 0; text-decoration:none; border-radius:4px; font-size:13px; }
+.product-card a.view:hover { background:#0056b3; }
+.product-detail { background:#2d2d2d; border:1px solid #555; border-radius:10px; padding:24px; max-width:860px; margin:0 auto; }
+.product-detail .layout { display:flex; flex-wrap:wrap; gap:24px; }
+.product-detail .layout img { width:300px; height:300px; border-radius:8px; }
+.product-detail .info { flex:1; min-width:240px; }
+.product-detail h1 { color:#fff; margin:0 0 6px 0; }
+.product-detail .tagline { color:#95a5a6; font-style:italic; margin-bottom:16px; }
+.product-detail .price { font-size:30px; color:#4a90e2; font-weight:bold; margin-bottom:18px; }
+.product-detail p { color:#b0b0b0; line-height:1.6; }
+.product-detail .actions { margin-top:22px; display:flex; gap:10px; flex-wrap:wrap; }
+.product-detail .actions a { padding:10px 18px; border-radius:6px; text-decoration:none; font-size:14px; font-weight:600; }
+.product-detail .actions .buy { background:#28a745; color:white; }
+.product-detail .actions .buy:hover { background:#1f8a36; }
+.product-detail .actions .back { background:#555; color:white; }
+.product-detail .actions .back:hover { background:#666; }
+`;
+}
+
+function renderProductsJS() {
+  return `// Demo shop client script — served as a real sub-resource so the
+// behavior analyzer sees a Sec-Fetch-Dest: script request per page load.
+(function () {
+  function ready(fn) {
+    if (document.readyState !== 'loading') fn();
+    else document.addEventListener('DOMContentLoaded', fn);
+  }
+  ready(function () {
+    document.querySelectorAll('.product-card a.view').forEach(function (a) {
+      a.addEventListener('click', function () {
+        try { console.log('[shop] product click ->', a.href); } catch (_e) {}
+      });
+    });
+    document.documentElement.setAttribute('data-shop-js', 'ready');
+  });
+})();
+`;
+}
+
+function renderShopPageWrapper(uuid, title, bodyInner) {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex, nofollow">
+  <title>${title}</title>
+  <link rel="stylesheet" href="/${uuid}/products/style.css">
+</head>
+<body>
+  <div class="container">
+    ${bodyInner}
+  </div>
+  <script src="/${uuid}/products/app.js"></script>
+</body>
+</html>`;
+}
+
 // JSON parsing for any future needs
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // For form data
@@ -1338,6 +1452,495 @@ app.delete('/clear-logs', (req, res) => {
   });
 });
 
+// ============================================================
+// Behavioral / Timing Signal Analysis
+// ============================================================
+// Given a stream of log rows (already filtered to one logger's UUID
+// scope), group requests by client and score 6 agent-vs-human signals.
+// Returns an array of per-client analyses sorted by bot score desc.
+function analyzeBehavior(logs) {
+  const parseFP = (log) => {
+    try { return log.network_fingerprint ? JSON.parse(log.network_fingerprint) : null; }
+    catch (_e) { return null; }
+  };
+  const parseHeaders = (log) => {
+    try { return JSON.parse(log.headers || '{}'); } catch (_e) { return {}; }
+  };
+  const parseUrl = (u, host) => {
+    try { return new URL(u, 'http://' + (host || 'h')); } catch (_e) { return null; }
+  };
+
+  // Group by client (IP + UA prefix). WS connections have method='WS' and
+  // bodies containing the client-side fingerprint; we still group them with
+  // their HTTP companions by IP because WS rows don't repeat the UA header.
+  const clients = new Map();
+  logs.forEach((log) => {
+    const fp = parseFP(log);
+    const h = parseHeaders(log);
+    const ip = (fp && fp.ip) || h['x-forwarded-for'] || h['x-real-ip'] || 'unknown';
+    const ua = ((fp && fp.headerFingerprint && fp.headerFingerprint.userAgent) || h['user-agent'] || 'none').toString();
+    const key = ip + '||' + ua.substring(0, 80);
+    if (!clients.has(key)) clients.set(key, { ip, ua, requests: [] });
+    clients.get(key).requests.push({
+      timestamp: log.timestamp,
+      timeMs: new Date(log.timestamp).getTime(),
+      method: log.method,
+      url: log.url || '',
+      path: (log.url || '').split('?')[0],
+      referer: h.referer || h.referrer || null,
+      acceptDest: h['sec-fetch-dest'] || null,
+      acceptMode: h['sec-fetch-mode'] || null,
+      acceptSite: h['sec-fetch-site'] || null,
+      acceptUser: h['sec-fetch-user'] || null,
+      accept: h.accept || null,
+      acceptEnc: h['accept-encoding'] || null,
+      acceptLang: h['accept-language'] || null,
+      secChUa: h['sec-ch-ua'] || null,
+      secChUaPlatform: h['sec-ch-ua-platform'] || null,
+      upgradeInsecure: h['upgrade-insecure-requests'] || null,
+      networkHash: fp && fp.networkHash || null
+    });
+  });
+
+  const analyses = [];
+  clients.forEach((data) => {
+    const reqs = data.requests.slice().sort((a, b) => a.timeMs - b.timeMs);
+
+    // -------- Browser signature -------- 
+    // Quantifies how "real-browser-like" this client's headers look.
+    // High confidence (>=70) means a real browser is doing the requests, so
+    // signals that key off MISSING things (no sub-resources, single path) are
+    // dampened — they are likely false positives on minimal pages.
+    const browserChecks = [
+      { name: 'sec-ch-ua',                weight: 18, pass: reqs.some((r) => !!r.secChUa),                       hint: 'Client hint sent only by Chromium-family browsers' },
+      { name: 'sec-fetch-dest',           weight: 12, pass: reqs.some((r) => !!r.acceptDest),                    hint: 'Fetch metadata sent by all modern browsers' },
+      { name: 'sec-fetch-mode',           weight: 10, pass: reqs.some((r) => !!r.acceptMode),                    hint: 'Fetch metadata header' },
+      { name: 'sec-fetch-site',           weight: 10, pass: reqs.some((r) => !!r.acceptSite),                    hint: 'Fetch metadata header' },
+      { name: 'Accept has image/*',       weight: 12, pass: reqs.some((r) => /image\//.test(r.accept || '')),     hint: 'Browsers advertise image media types on navigation' },
+      { name: 'Accept has 3+ types',      weight: 8,  pass: reqs.some((r) => (r.accept || '').split(',').length >= 3), hint: 'Multi-type Accept = browser navigation' },
+      { name: 'Accept-Encoding br/zstd',  weight: 10, pass: reqs.some((r) => /\b(br|zstd)\b/.test(r.acceptEnc || '')), hint: 'curl/python rarely negotiate br/zstd' },
+      { name: 'Accept-Language',          weight: 8,  pass: reqs.some((r) => !!r.acceptLang),                    hint: 'Almost always sent by browsers' },
+      { name: 'Upgrade-Insecure-Requests',weight: 6,  pass: reqs.some((r) => r.upgradeInsecure === '1'),         hint: 'Sent by browsers on top-level navigation' },
+      { name: 'WS fingerprint sent',      weight: 6,  pass: reqs.some((r) => r.method === 'WS'),                 hint: 'Companion WebSocket fingerprint = JS executed = real browser' }
+    ];
+    const browserConfidence = browserChecks.reduce((s, c) => s + (c.pass ? c.weight : 0), 0);
+    const browserStrong = browserConfidence >= 70;
+    const browserMedium = browserConfidence >= 40;
+
+    // 1) Inter-request deltas (ms) and cadence stats
+    const deltas = [];
+    for (let i = 1; i < reqs.length; i++) deltas.push(reqs[i].timeMs - reqs[i - 1].timeMs);
+    const mean = deltas.length ? deltas.reduce((a, b) => a + b, 0) / deltas.length : 0;
+    const variance = deltas.length ? deltas.reduce((a, b) => a + (b - mean) * (b - mean), 0) / deltas.length : 0;
+    const stdev = Math.sqrt(variance);
+    const cov = mean > 0 ? stdev / mean : 0; // coefficient of variation
+
+    // 2) Idle time (gaps > 5s)
+    const LONG_GAP_MS = 5000;
+    const longGaps = deltas.filter((d) => d > LONG_GAP_MS).length;
+    const maxGap = deltas.length ? Math.max.apply(null, deltas) : 0;
+
+    // 3) Parallel requests within 100ms windows
+    const PARALLEL_WIN_MS = 100;
+    let parallelCount = 0;
+    let burstWindows = 0;
+    for (let i = 0; i < reqs.length;) {
+      const end = reqs[i].timeMs + PARALLEL_WIN_MS;
+      let count = 1;
+      let j = i + 1;
+      while (j < reqs.length && reqs[j].timeMs <= end) { count++; j++; }
+      if (count > 1) { parallelCount += count; burstWindows++; }
+      i = j;
+    }
+
+    // 4) Resource loading: HTML doc requests followed within 5s by sub-resources
+    const htmlReqs = reqs.filter((r) =>
+      (r.accept || '').includes('text/html') || r.acceptDest === 'document' || /\.html?$/.test(r.path)
+    );
+    const subResDestSet = new Set(['image', 'script', 'style', 'font', 'iframe']);
+    let subResourceCount = 0;
+    let pagesWithResources = 0;
+    htmlReqs.forEach((p) => {
+      const subs = reqs.filter((r) =>
+        r !== p && r.timeMs > p.timeMs && (r.timeMs - p.timeMs) < 5000 && subResDestSet.has(r.acceptDest)
+      );
+      subResourceCount += subs.length;
+      if (subs.length > 0) pagesWithResources++;
+    });
+
+    // 5) Referer chain continuity
+    let refererPresent = 0;
+    let refererMatches = 0;
+    let refererMissing = 0;
+    const seenPaths = new Set();
+    for (let i = 0; i < reqs.length; i++) {
+      const r = reqs[i];
+      if (i === 0 || r.method === 'WS') { seenPaths.add(r.path); continue; }
+      if (r.referer) {
+        refererPresent++;
+        const u = parseUrl(r.referer);
+        const refPath = u ? u.pathname : null;
+        if (refPath && seenPaths.has(refPath)) refererMatches++;
+      } else {
+        refererMissing++;
+      }
+      seenPaths.add(r.path);
+    }
+
+    // 6) Session depth
+    const uniquePaths = new Set(reqs.map((r) => r.path)).size;
+    const entryPath = reqs[0] ? reqs[0].path : '';
+    const visitedLogger = reqs.some((r) => /\/logger$/.test(r.path));
+    const visitedRoot = reqs.some((r) => r.path === '/');
+
+    // Cadence percentiles (for evidence display)
+    const sortedDeltas = deltas.slice().sort((a, b) => a - b);
+    const pct = (p) => sortedDeltas.length ? sortedDeltas[Math.min(sortedDeltas.length - 1, Math.floor(sortedDeltas.length * p))] : 0;
+    const minGap = sortedDeltas[0] || 0;
+    const p50Gap = pct(0.5);
+    const p95Gap = pct(0.95);
+
+    // -------- Scoring (each 0..100 where 100 = strongly bot-like) --------
+    // Each signal also produces an `evidence` object describing WHY it scored
+    // that way, and a `reason` string describing the rule that fired.
+
+    let cadenceScore, cadenceLabel, cadenceReason;
+    if (reqs.length < 3) { cadenceLabel = 'Too few requests to score'; cadenceScore = 30; cadenceReason = 'Need ≥3 requests to compute timing variability'; }
+    else if (cov < 0.2) { cadenceLabel = 'Suspiciously uniform timing'; cadenceScore = 90; cadenceReason = 'CoV < 0.2 → bot-uniform'; }
+    else if (cov < 0.5) { cadenceLabel = 'Low timing variability'; cadenceScore = 65; cadenceReason = 'CoV < 0.5 → low variability'; }
+    else if (cov > 3.0) { cadenceLabel = 'Bursty (possible scripted bursts)'; cadenceScore = 55; cadenceReason = 'CoV > 3.0 → very bursty'; }
+    else { cadenceLabel = 'Human-like timing variability'; cadenceScore = 15; cadenceReason = '0.5 ≤ CoV ≤ 3.0 → human-variable'; }
+    const cadenceEvidence = {
+      'mean gap': mean ? Math.round(mean) + ' ms' : '—',
+      'stdev': stdev ? Math.round(stdev) + ' ms' : '—',
+      'CoV (stdev/mean)': mean > 0 ? Number(cov.toFixed(3)) : '—',
+      'min / p50 / p95 / max': minGap + ' / ' + p50Gap + ' / ' + p95Gap + ' / ' + maxGap + ' ms',
+      'sample size': deltas.length + ' gap(s)',
+      'rule that fired': cadenceReason
+    };
+
+    let idleScore, idleLabel, idleReason;
+    if (reqs.length < 2) { idleLabel = 'Single request'; idleScore = 35; idleReason = 'Not enough data'; }
+    else if (longGaps === 0 && mean < 1000) { idleLabel = 'No think-time detected'; idleScore = 85; idleReason = 'No gaps > 5s AND mean gap < 1s'; }
+    else if (longGaps === 0) { idleLabel = 'No pauses (>5s) but spaced'; idleScore = 45; idleReason = 'No gaps > 5s but reqs are slow-paced'; }
+    else { idleLabel = longGaps + ' pause(s) >5s present'; idleScore = 10; idleReason = 'Has ≥1 natural pause > 5s'; }
+    const longGapValues = deltas.filter((d) => d > LONG_GAP_MS).map((d) => (d / 1000).toFixed(1) + 's');
+    const idleEvidence = {
+      'gaps longer than 5s': longGaps,
+      'their durations': longGapValues.length ? longGapValues.slice(0, 10).join(', ') : '(none)',
+      'longest gap': maxGap ? (maxGap / 1000).toFixed(1) + 's' : '—',
+      'rule that fired': idleReason
+    };
+
+    let parallelScore, parallelLabel, parallelReason;
+    if (parallelCount === 0) {
+      parallelLabel = 'No concurrent requests';
+      parallelScore = browserStrong ? 15 : 30;
+      parallelReason = browserStrong ? 'No bursts + strong browser headers → normal navigation' : 'No concurrent requests';
+    } else if (subResourceCount > 0 && parallelCount > 2) {
+      parallelLabel = 'Concurrent fetches (sub-resources)';
+      parallelScore = 10;
+      parallelReason = 'Concurrent reqs accompanied by sub-resource fetches → browser';
+    } else {
+      parallelLabel = parallelCount + ' concurrent req(s) in ' + burstWindows + ' burst(s)';
+      parallelScore = 70;
+      parallelReason = 'Concurrent reqs without sub-resource pattern → scripted';
+    }
+    const parallelEvidence = {
+      'concurrent requests': parallelCount,
+      'burst windows (100 ms)': burstWindows,
+      'window size': PARALLEL_WIN_MS + ' ms',
+      'rule that fired': parallelReason
+    };
+
+    let resourceScore, resourceLabel, resourceReason;
+    if (htmlReqs.length === 0) {
+      if (browserStrong) {
+        resourceLabel = 'No HTML page hits, but browser-headers present';
+        resourceScore = 40;
+        resourceReason = 'Endpoint-only hits but headers are browser-like (XHR/fetch from a SPA?)';
+      } else {
+        resourceLabel = 'No HTML page hits (endpoint-only)';
+        resourceScore = 85;
+        resourceReason = 'No HTML requested at all → endpoint-only access pattern';
+      }
+    } else if (subResourceCount === 0) {
+      if (browserStrong) {
+        resourceLabel = 'No sub-resources, but headers strongly browser-like';
+        resourceScore = 20;
+        resourceReason = 'Zero sub-resources is ambiguous because the page may have none (inline CSS/JS) — headers indicate real browser';
+      } else if (browserMedium) {
+        resourceLabel = 'No sub-resources (browser headers partial)';
+        resourceScore = 55;
+        resourceReason = 'Mixed signal: some browser headers but no resource follow-ups';
+      } else {
+        resourceLabel = 'HTML loaded but NO sub-resources fetched';
+        resourceScore = 95;
+        resourceReason = 'HTML hit without follow-up CSS/JS/images AND no browser headers';
+      }
+    } else if (subResourceCount < 3) {
+      resourceLabel = 'Few sub-resources (' + subResourceCount + ')';
+      resourceScore = 45;
+      resourceReason = '<3 sub-resources fetched after HTML';
+    } else {
+      resourceLabel = subResourceCount + ' sub-resources loaded';
+      resourceScore = 10;
+      resourceReason = '≥3 sub-resources → typical browser load';
+    }
+    const destsSeen = Array.from(new Set(reqs.map((r) => r.acceptDest).filter(Boolean)));
+    const resourceEvidence = {
+      'HTML page hits': htmlReqs.length,
+      'sub-resources within 5s': subResourceCount,
+      'pages with resources': pagesWithResources,
+      'Sec-Fetch-Dest values seen': destsSeen.length ? destsSeen.join(', ') : '(none)',
+      'browser-signature damping applied': browserStrong ? 'yes (high confidence)' : browserMedium ? 'partial' : 'no',
+      'rule that fired': resourceReason
+    };
+
+    let refererScore, refererLabel, refererReason;
+    if (reqs.length < 2) {
+      refererLabel = 'Single request';
+      refererScore = 30;
+      refererReason = 'Cannot evaluate a chain from a single request';
+    } else if (refererMissing > 0 && (refererMissing / Math.max(1, reqs.length - 1)) > 0.5) {
+      refererLabel = refererMissing + ' missing referer(s)';
+      refererScore = 80;
+      refererReason = '>50% of follow-up requests have no Referer header';
+    } else if (refererPresent > 0 && (refererMatches / refererPresent) < 0.4) {
+      refererLabel = 'Referer chain has gaps (' + refererMatches + '/' + refererPresent + ' match)';
+      refererScore = 75;
+      refererReason = '<40% of Referers point to a previously-visited URL';
+    } else if (refererPresent > 0) {
+      refererLabel = 'Plausible referer chain (' + refererMatches + '/' + refererPresent + ')';
+      refererScore = 15;
+      refererReason = 'Most Referers point to previously-visited URLs';
+    } else {
+      refererLabel = 'No referer headers';
+      refererScore = 65;
+      refererReason = 'Zero Referer headers across the session';
+    }
+    const refererEvidence = {
+      'follow-up requests (post-first)': Math.max(0, reqs.length - 1),
+      'with Referer header': refererPresent,
+      'matching a previously-visited path': refererMatches,
+      'missing Referer header': refererMissing,
+      'match ratio': refererPresent > 0 ? (refererMatches / refererPresent * 100).toFixed(0) + '%' : 'n/a',
+      'rule that fired': refererReason
+    };
+
+    let depthScore, depthLabel, depthReason;
+    if (uniquePaths === 1) {
+      depthLabel = 'Visited 1 path only — direct hit';
+      depthScore = browserStrong ? 45 : 75;
+      depthReason = browserStrong ? 'Single path but real-browser headers (user pasted URL?)' : 'Direct hit on a single endpoint, no navigation';
+    } else if (visitedLogger && !visitedRoot) {
+      depthLabel = 'Skipped landing, hit logger directly';
+      depthScore = browserStrong ? 30 : 60;
+      depthReason = browserStrong ? 'Pasted-URL navigation in a real browser is normal' : 'Did not visit landing page before target URL';
+    } else if (uniquePaths < 3) {
+      depthLabel = 'Shallow navigation (' + uniquePaths + ' paths)';
+      depthScore = 35;
+      depthReason = '<3 unique paths visited';
+    } else {
+      depthLabel = 'Explored ' + uniquePaths + ' paths';
+      depthScore = 20;
+      depthReason = '≥3 unique paths visited';
+    }
+    const visitedPathSamples = Array.from(new Set(reqs.map((r) => r.path))).slice(0, 8);
+    const depthEvidence = {
+      'unique paths': uniquePaths,
+      'sample paths': visitedPathSamples.join(', '),
+      'entry path': entryPath,
+      'visited / (root)': visitedRoot ? 'yes' : 'no',
+      'visited a /logger path': visitedLogger ? 'yes' : 'no',
+      'browser-signature damping applied': browserStrong ? 'yes (high confidence)' : 'no',
+      'rule that fired': depthReason
+    };
+
+    const signals = [
+      { key: 'cadence',   score: cadenceScore,  weight: 0.20, label: cadenceLabel,  title: 'Request cadence',  human: 'Variable intervals (CoV > 0.5)',                  agent: 'Uniform metronome OR scripted bursts',                evidence: cadenceEvidence  },
+      { key: 'idle',      score: idleScore,     weight: 0.15, label: idleLabel,     title: 'Idle / think time', human: 'Has natural pauses >5s',                          agent: 'Proceeds immediately, no pauses',                    evidence: idleEvidence     },
+      { key: 'parallel',  score: parallelScore, weight: 0.10, label: parallelLabel, title: 'Parallel requests', human: 'Browser fires sub-resource fetches in parallel',  agent: 'Concurrent reqs to same endpoint (no sub-resources)', evidence: parallelEvidence },
+      { key: 'resources', score: resourceScore, weight: 0.25, label: resourceLabel, title: 'Resource loading',  human: 'HTML page → CSS/JS/image follow-ups',             agent: 'Only hits the target endpoint',                       evidence: resourceEvidence },
+      { key: 'referer',   score: refererScore,  weight: 0.15, label: refererLabel,  title: 'Referer chain',     human: 'Referer points to a previously-visited URL',      agent: 'No referer or mismatched referer',                    evidence: refererEvidence  },
+      { key: 'depth',     score: depthScore,    weight: 0.15, label: depthLabel,    title: 'Session depth',     human: 'Lands on /, navigates through pages',             agent: 'Hits the target URL directly, no navigation',         evidence: depthEvidence    }
+    ];
+    const botScore = signals.reduce((acc, s) => acc + s.score * s.weight, 0);
+
+    let verdict;
+    if (botScore >= 70) verdict = '🤖 Likely Agent';
+    else if (botScore >= 50) verdict = '⚠️ Suspicious';
+    else if (botScore >= 30) verdict = '🧐 Mixed signals';
+    else verdict = '🧑 Likely Human';
+
+    const browserSignature = {
+      confidence: browserConfidence,
+      label: browserConfidence >= 80 ? 'Strong browser headers'
+            : browserConfidence >= 50 ? 'Mixed browser headers'
+            : 'Weak / non-browser headers',
+      checks: browserChecks.map((c) => ({ name: c.name, weight: c.weight, pass: c.pass, hint: c.hint }))
+    };
+
+    analyses.push({
+      client: { ip: data.ip, ua: data.ua },
+      requestCount: reqs.length,
+      timeSpanMs: reqs.length > 1 ? reqs[reqs.length - 1].timeMs - reqs[0].timeMs : 0,
+      firstSeen: reqs[0] ? reqs[0].timestamp : null,
+      lastSeen: reqs[reqs.length - 1] ? reqs[reqs.length - 1].timestamp : null,
+      botScore: Math.round(botScore),
+      verdict,
+      browserSignature,
+      signals,
+      stats: {
+        deltas,
+        meanGapMs: Math.round(mean),
+        stdevGapMs: Math.round(stdev),
+        coefficientOfVariation: Number(cov.toFixed(3)),
+        longGapsCount: longGaps,
+        maxGapMs: maxGap,
+        parallelCount,
+        burstWindows,
+        subResourceCount,
+        pagesWithResources,
+        htmlReqCount: htmlReqs.length,
+        refererPresent,
+        refererMatches,
+        refererMissing,
+        uniquePaths,
+        entryPath,
+        visitedLogger,
+        visitedRoot
+      },
+      sample: reqs.slice(0, 40).map((r) => ({
+        t: r.timestamp,
+        method: r.method,
+        path: r.path,
+        ref: r.referer,
+        dest: r.acceptDest
+      }))
+    });
+  });
+
+  analyses.sort((a, b) => b.botScore - a.botScore);
+  return analyses;
+}
+
+// Tiny inline SVG sparkline of inter-request gaps (ms). Used by /:uuid/behavior.
+function renderDeltaSparkline(deltas, width, height) {
+  width = width || 320; height = height || 60;
+  if (!deltas || !deltas.length) {
+    return '<span style="color:#888;font-size:12px;">(no inter-request gaps)</span>';
+  }
+  const max = Math.max.apply(null, deltas.concat([1]));
+  const barW = width / deltas.length;
+  const bars = deltas.map((d, i) => {
+    const h = Math.max(1, (d / max) * (height - 4));
+    const x = i * barW;
+    const y = height - h;
+    const color = d < 100 ? '#ff6b6b' : d < 1000 ? '#f39c12' : d < 5000 ? '#4a90e2' : '#28a745';
+    const title = '#' + (i + 1) + ': ' + d + ' ms';
+    return '<rect x="' + x.toFixed(2) + '" y="' + y.toFixed(2) + '" width="' + Math.max(1, barW - 1).toFixed(2) + '" height="' + h.toFixed(2) + '" fill="' + color + '"><title>' + title + '</title></rect>';
+  }).join('');
+  return '<svg width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '" style="background:#1a1a1a;border-radius:4px;display:block;">' + bars + '</svg>';
+}
+
+// ============================================================
+// Demo Shop routes (resource-loading test fixture)
+// ============================================================
+// IMPORTANT: register the literal sub-paths BEFORE /:uuid/products/:productId
+// otherwise Express will treat 'style.css' / 'app.js' / 'images' as a product id.
+
+// External stylesheet — triggers Sec-Fetch-Dest: style
+app.get('/:uuid/products/style.css', (req, res) => {
+  if (!LOGGER_UUIDS.includes(req.params.uuid)) return res.status(404).type('text/plain').send('unknown logger');
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.type('text/css').send(renderProductsCSS());
+});
+
+// External script — triggers Sec-Fetch-Dest: script
+app.get('/:uuid/products/app.js', (req, res) => {
+  if (!LOGGER_UUIDS.includes(req.params.uuid)) return res.status(404).type('text/plain').send('unknown logger');
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.type('application/javascript').send(renderProductsJS());
+});
+
+// Product image — triggers Sec-Fetch-Dest: image
+app.get('/:uuid/products/images/:productId.svg', (req, res) => {
+  if (!LOGGER_UUIDS.includes(req.params.uuid)) return res.status(404).type('text/plain').send('unknown logger');
+  const p = PRODUCT_MAP[req.params.productId];
+  if (!p) return res.status(404).type('text/plain').send('unknown product');
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.type('image/svg+xml').send(renderProductSVG(p));
+});
+
+// Product detail page
+app.get('/:uuid/products/:productId', (req, res) => {
+  if (!LOGGER_UUIDS.includes(req.params.uuid)) return res.redirect('/');
+  const uuid = req.params.uuid;
+  const p = PRODUCT_MAP[req.params.productId];
+  if (!p) {
+    return res.status(404).send(renderShopPageWrapper(uuid, 'Not found',
+      `<h1>Not found</h1>
+       <p class="subtitle">No product with id <code>${req.params.productId}</code>.</p>
+       <a href="/${uuid}/products" class="nav-link" style="background:#34495e;">← Back to catalog</a>`));
+  }
+  const body = `
+      <div style="margin-bottom:18px;">
+        <a href="/${uuid}/products" class="nav-link" style="background:#34495e;">← Back to catalog</a>
+        <a href="/${uuid}/logger"   class="nav-link" style="background:#007bff;">📋 Logger</a>
+        <a href="/${uuid}/behavior" class="nav-link" style="background:#8e44ad;">🧠 Behavioral Analysis</a>
+      </div>
+      <div class="product-detail">
+        <div class="layout">
+          <img src="/${uuid}/products/images/${p.id}.svg" alt="${p.name}">
+          <div class="info">
+            <h1>${p.name}</h1>
+            <div class="tagline">${p.tagline}</div>
+            <div class="price">$${p.price.toFixed(2)}</div>
+            <p>${p.description}</p>
+            <div class="actions">
+              <a class="buy"  href="#">Add to cart</a>
+              <a class="back" href="/${uuid}/products">Keep browsing</a>
+            </div>
+          </div>
+        </div>
+      </div>
+  `;
+  res.send(renderShopPageWrapper(uuid, `${p.name} — Demo Shop`, body));
+});
+
+// Products list page (catalog)
+app.get('/:uuid/products', (req, res) => {
+  if (!LOGGER_UUIDS.includes(req.params.uuid)) return res.redirect('/');
+  const uuid = req.params.uuid;
+  const cards = PRODUCTS.map((p) => `
+    <div class="product-card">
+      <img src="/${uuid}/products/images/${p.id}.svg" alt="${p.name}">
+      <div class="meta">
+        <div class="name">${p.name}</div>
+        <div class="tagline">${p.tagline}</div>
+        <div class="price">$${p.price.toFixed(2)}</div>
+        <a href="/${uuid}/products/${p.id}" class="view">View details →</a>
+      </div>
+    </div>
+  `).join('');
+  const body = `
+      <h1>🛍️ Demo Shop</h1>
+      <div class="subtitle">
+        Browse the catalog to generate realistic resource-loading patterns for the analyzer.
+        Each page loads <code>style.css</code>, <code>app.js</code>, and product SVGs as separate sub-resources.
+      </div>
+      <div style="margin-bottom:22px;">
+        <a href="/${uuid}/logger"   class="nav-link" style="background:#34495e;">← Back to logger</a>
+        <a href="/${uuid}/behavior" class="nav-link" style="background:#8e44ad;">🧠 Behavioral Analysis</a>
+      </div>
+      <div class="product-grid">
+        ${cards}
+      </div>
+  `;
+  res.send(renderShopPageWrapper(uuid, 'Demo Shop — ' + uuid.substring(0, 8), body));
+});
+
 // Logger page with UUID path (dynamic route handler)
 app.get('/:uuid/logger', (req, res) => {
   // Check if the UUID matches any of the current UUIDs
@@ -1559,6 +2162,8 @@ app.get('/:uuid/logger', (req, res) => {
   <h1>🌐 HTTP Request Logger</h1>
   
   <div style="text-align: center; margin-bottom: 30px;">
+    <a href="/${req.params.uuid}/behavior" class="nav-link" style="background-color: #8e44ad;">🧠 Behavioral Analysis</a>
+    <a href="/${req.params.uuid}/products" class="nav-link" style="background-color: #16a085;">🛍️ Open Shop</a>
     <a href="/objects" class="nav-link">🔍 Browser Objects Explorer</a>
     <a href="/logs" class="nav-link">📋 View Logs API</a>
     <button id="clearLogsBtn" style="background-color: #dc3545; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin: 10px 5px; cursor: pointer; font-size: 14px; transition: background-color 0.3s;">🗑️ Clear Logs</button>
@@ -1624,6 +2229,256 @@ app.get('/:uuid/logger', (req, res) => {
 </body>
 </html>`);
   });
+});
+
+
+// ============================================================
+// Behavioral Analysis page (per-logger)
+// ============================================================
+// JSON API: returns analyses array for programmatic use.
+app.get('/:uuid/behavior.json', (req, res) => {
+  if (!LOGGER_UUIDS.includes(req.params.uuid)) {
+    return res.status(404).json({ error: 'unknown logger uuid' });
+  }
+  const like = '/' + req.params.uuid + '/%';
+  db.all(
+    `SELECT method,url,headers,body,timestamp,network_fingerprint FROM logs
+     WHERE url LIKE ? ORDER BY id ASC`,
+    [like],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({
+        uuid: req.params.uuid,
+        totalRequests: rows.length,
+        clients: analyzeBehavior(rows)
+      });
+    }
+  );
+});
+
+// HTML "detective" page
+app.get('/:uuid/behavior', (req, res) => {
+  if (!LOGGER_UUIDS.includes(req.params.uuid)) {
+    return res.redirect('/');
+  }
+  const like = '/' + req.params.uuid + '/%';
+  db.all(
+    `SELECT method,url,headers,body,timestamp,network_fingerprint FROM logs
+     WHERE url LIKE ? ORDER BY id ASC`,
+    [like],
+    (err, rows) => {
+      if (err) return res.status(500).send('DB error: ' + err.message);
+
+      const analyses = analyzeBehavior(rows);
+      const uuid = req.params.uuid;
+
+      const verdictColor = (s) => s >= 70 ? '#e74c3c' : s >= 50 ? '#f39c12' : s >= 30 ? '#f1c40f' : '#2ecc71';
+      const signalColor = (s) => s >= 70 ? '#e74c3c' : s >= 50 ? '#f39c12' : s >= 30 ? '#f1c40f' : '#2ecc71';
+
+      const clientsHtml = analyses.length === 0 ? `
+        <div style="text-align:center;padding:60px 20px;color:#95a5a6;border:1px dashed #555;border-radius:8px;">
+          <h3 style="margin:0 0 10px 0;">No traffic on this logger yet</h3>
+          <p style="margin:0;">Have a client (or agent) visit <code style="color:#4a90e2;">/${uuid}/logger</code>, then refresh this page.</p>
+        </div>
+      ` : analyses.map((a, idx) => {
+        const escapeHtml = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const renderEvidence = (ev) => {
+          if (!ev || typeof ev !== 'object') return '';
+          const rows = Object.entries(ev).map(([k, v]) => `
+            <tr>
+              <td style="padding:3px 8px 3px 0;color:#7f8c8d;font-size:11px;vertical-align:top;white-space:nowrap;">${escapeHtml(k)}</td>
+              <td style="padding:3px 0;color:#e0e0e0;font-size:11px;font-family:monospace;word-break:break-all;">${escapeHtml(v)}</td>
+            </tr>
+          `).join('');
+          return `<table style="width:100%;border-collapse:collapse;margin-top:8px;">${rows}</table>`;
+        };
+        const signalsHtml = a.signals.map((s) => `
+          <div style="background:#2d2d2d;border:1px solid #555;border-left:4px solid ${signalColor(s.score)};border-radius:6px;padding:12px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <strong style="color:#e0e0e0;font-size:13px;">${s.title}</strong>
+              <span style="background:${signalColor(s.score)};color:white;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:bold;">${s.score}/100</span>
+            </div>
+            <div style="color:#b0b0b0;font-size:12px;margin-bottom:8px;">${s.label}</div>
+            <div style="font-size:10px;color:#7f8c8d;line-height:1.4;margin-bottom:8px;">
+              <div><span style="color:#2ecc71;">human:</span> ${s.human}</div>
+              <div><span style="color:#e74c3c;">agent:</span> ${s.agent}</div>
+            </div>
+            <details style="background:#1a1a1a;border:1px solid #3a3a3a;border-radius:4px;padding:6px 10px;">
+              <summary style="cursor:pointer;color:#8e44ad;font-size:11px;user-select:none;">🔬 Evidence (why this score?)</summary>
+              ${renderEvidence(s.evidence)}
+            </details>
+          </div>
+        `).join('');
+
+        // Browser signature panel
+        const bs = a.browserSignature || { confidence: 0, label: 'unknown', checks: [] };
+        const bsColor = bs.confidence >= 70 ? '#2ecc71' : bs.confidence >= 40 ? '#f39c12' : '#e74c3c';
+        const bsChecksHtml = bs.checks.map((c) => `
+          <tr style="border-bottom:1px solid #2d2d2d;">
+            <td style="padding:4px 8px;font-size:11px;">
+              <span style="color:${c.pass ? '#2ecc71' : '#e74c3c'};font-weight:bold;">${c.pass ? '✓' : '✗'}</span>
+              <span style="color:#e0e0e0;margin-left:6px;font-family:monospace;">${escapeHtml(c.name)}</span>
+            </td>
+            <td style="padding:4px 8px;color:#7f8c8d;font-size:10px;text-align:right;white-space:nowrap;">weight ${c.weight}</td>
+            <td style="padding:4px 8px;color:#95a5a6;font-size:10px;">${escapeHtml(c.hint)}</td>
+          </tr>
+        `).join('');
+        const browserSignatureHtml = `
+          <div style="background:#2d2d2d;border:1px solid #555;border-left:4px solid ${bsColor};border-radius:6px;padding:12px;margin-bottom:15px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px;">
+              <div>
+                <strong style="color:#e0e0e0;font-size:13px;">🌐 Browser signature</strong>
+                <span style="color:#7f8c8d;font-size:11px;margin-left:8px;">(used to damp resource/parallel/depth signals — does NOT contribute to bot score directly)</span>
+              </div>
+              <span style="background:${bsColor};color:white;padding:2px 10px;border-radius:10px;font-size:12px;font-weight:bold;">${bs.confidence}/100 · ${escapeHtml(bs.label)}</span>
+            </div>
+            <details style="background:#1a1a1a;border:1px solid #3a3a3a;border-radius:4px;padding:6px 10px;">
+              <summary style="cursor:pointer;color:#8e44ad;font-size:11px;user-select:none;">🔬 Header checks (${bs.checks.filter((c) => c.pass).length}/${bs.checks.length} passed)</summary>
+              <table style="width:100%;border-collapse:collapse;margin-top:8px;">${bsChecksHtml}</table>
+            </details>
+          </div>
+        `;
+
+        const sampleRowsHtml = a.sample.map((r) => `
+          <tr>
+            <td style="padding:4px 8px;color:#7f8c8d;font-size:11px;white-space:nowrap;">${r.t}</td>
+            <td style="padding:4px 8px;color:#4a90e2;font-weight:bold;font-size:11px;">${r.method}</td>
+            <td style="padding:4px 8px;font-family:monospace;font-size:11px;color:#e0e0e0;">${r.path}</td>
+            <td style="padding:4px 8px;color:#95a5a6;font-size:10px;">${r.dest || ''}</td>
+            <td style="padding:4px 8px;color:#7f8c8d;font-size:10px;word-break:break-all;max-width:300px;">${r.ref ? r.ref.replace(/^https?:\/\/[^\/]+/, '') : '—'}</td>
+          </tr>
+        `).join('');
+
+        const stats = a.stats;
+        return `
+          <div class="client-card" style="background:#1f1f1f;border:1px solid #444;border-radius:10px;padding:20px;margin-bottom:20px;border-top:4px solid ${verdictColor(a.botScore)};">
+            <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-start;gap:15px;margin-bottom:15px;">
+              <div style="flex:1;min-width:300px;">
+                <div style="font-size:11px;color:#7f8c8d;margin-bottom:4px;">Client #${idx + 1}</div>
+                <div style="font-size:16px;color:#e0e0e0;font-family:monospace;margin-bottom:6px;">
+                  <strong style="color:#4a90e2;">${a.client.ip}</strong>
+                </div>
+                <div style="font-size:11px;color:#95a5a6;word-break:break-all;line-height:1.4;">${a.client.ua}</div>
+              </div>
+              <div style="text-align:right;">
+                <div style="display:inline-block;background:${verdictColor(a.botScore)};color:white;padding:6px 14px;border-radius:20px;font-weight:bold;font-size:14px;margin-bottom:6px;">
+                  ${a.verdict}
+                </div>
+                <div style="font-size:12px;color:#95a5a6;">Bot score: <strong style="color:${verdictColor(a.botScore)};">${a.botScore}/100</strong></div>
+              </div>
+            </div>
+
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:15px;padding:12px;background:#2d2d2d;border-radius:6px;">
+              <div><div style="font-size:10px;color:#7f8c8d;">REQUESTS</div><div style="font-size:18px;font-weight:bold;color:#e0e0e0;">${a.requestCount}</div></div>
+              <div><div style="font-size:10px;color:#7f8c8d;">SESSION SPAN</div><div style="font-size:18px;font-weight:bold;color:#e0e0e0;">${(a.timeSpanMs/1000).toFixed(1)}s</div></div>
+              <div><div style="font-size:10px;color:#7f8c8d;">MEAN GAP</div><div style="font-size:18px;font-weight:bold;color:#e0e0e0;">${stats.meanGapMs} ms</div></div>
+              <div><div style="font-size:10px;color:#7f8c8d;">STDEV / CoV</div><div style="font-size:18px;font-weight:bold;color:#e0e0e0;">${stats.stdevGapMs} / ${stats.coefficientOfVariation}</div></div>
+              <div><div style="font-size:10px;color:#7f8c8d;">UNIQUE PATHS</div><div style="font-size:18px;font-weight:bold;color:#e0e0e0;">${stats.uniquePaths}</div></div>
+              <div><div style="font-size:10px;color:#7f8c8d;">SUB-RESOURCES</div><div style="font-size:18px;font-weight:bold;color:#e0e0e0;">${stats.subResourceCount}</div></div>
+              <div><div style="font-size:10px;color:#7f8c8d;">BROWSER SIG</div><div style="font-size:18px;font-weight:bold;color:${bsColor};">${bs.confidence}/100</div></div>
+            </div>
+
+            <div style="margin-bottom:15px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                <strong style="color:#e0e0e0;font-size:13px;">Inter-request gaps (ms)</strong>
+                <span style="font-size:10px;color:#7f8c8d;">
+                  <span style="display:inline-block;width:8px;height:8px;background:#ff6b6b;border-radius:2px;"></span> &lt;100ms
+                  <span style="display:inline-block;width:8px;height:8px;background:#f39c12;border-radius:2px;margin-left:8px;"></span> &lt;1s
+                  <span style="display:inline-block;width:8px;height:8px;background:#4a90e2;border-radius:2px;margin-left:8px;"></span> &lt;5s
+                  <span style="display:inline-block;width:8px;height:8px;background:#28a745;border-radius:2px;margin-left:8px;"></span> ≥5s
+                </span>
+              </div>
+              ${renderDeltaSparkline(stats.deltas, 720, 70)}
+              <div style="font-size:10px;color:#7f8c8d;margin-top:4px;">Each bar = one inter-request gap, sorted in time order. Uniform heights ⇒ metronome (bot). Mixed heights with tall greens ⇒ human think-time.</div>
+            </div>
+
+            ${browserSignatureHtml}
+
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:15px;">
+              ${signalsHtml}
+            </div>
+
+            <details style="background:#1a1a1a;border:1px solid #444;border-radius:6px;padding:10px;">
+              <summary style="cursor:pointer;color:#4a90e2;font-size:12px;user-select:none;">📋 Request sample (first ${a.sample.length} of ${a.requestCount})</summary>
+              <div style="overflow-x:auto;margin-top:10px;">
+                <table style="width:100%;border-collapse:collapse;font-size:11px;">
+                  <thead><tr style="background:#2d2d2d;">
+                    <th style="padding:6px 8px;text-align:left;color:#7f8c8d;">Time</th>
+                    <th style="padding:6px 8px;text-align:left;color:#7f8c8d;">Method</th>
+                    <th style="padding:6px 8px;text-align:left;color:#7f8c8d;">Path</th>
+                    <th style="padding:6px 8px;text-align:left;color:#7f8c8d;">Dest</th>
+                    <th style="padding:6px 8px;text-align:left;color:#7f8c8d;">Referer</th>
+                  </tr></thead>
+                  <tbody>${sampleRowsHtml}</tbody>
+                </table>
+              </div>
+            </details>
+          </div>
+        `;
+      }).join('');
+
+      res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex, nofollow">
+  <title>🧠 Behavioral Analysis — ${uuid.substring(0, 8)}</title>
+  <style>
+    body {
+      background-color: #1a1a1a;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0;
+      padding: 20px;
+    }
+    .container { max-width: 1200px; margin: 0 auto; }
+    h1 { color: #fff; margin: 0 0 6px 0; }
+    .subtitle { color: #95a5a6; margin-bottom: 24px; font-size: 13px; }
+    .nav-link {
+      display: inline-block; background-color: #007bff; color: white;
+      padding: 8px 16px; text-decoration: none; border-radius: 6px;
+      margin: 0 4px 0 0; font-size: 13px; transition: background-color 0.2s;
+    }
+    .nav-link:hover { background-color: #0056b3; }
+    .legend {
+      background: #2d2d2d; border: 1px solid #555; border-radius: 8px;
+      padding: 14px 18px; margin-bottom: 22px; font-size: 13px; line-height: 1.5;
+    }
+    .legend strong { color: #8e44ad; }
+    code { background: #2d2d2d; padding: 2px 5px; border-radius: 3px; color: #4a90e2; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🧠 Behavioral Analysis</h1>
+    <div class="subtitle">Logger UUID: <code>${uuid}</code> &nbsp;·&nbsp; ${rows.length} request(s) in scope &nbsp;·&nbsp; ${analyses.length} client(s)</div>
+
+    <div style="margin-bottom: 22px;">
+      <a href="/${uuid}/logger" class="nav-link">← Back to logger</a>
+      <a href="/${uuid}/products" class="nav-link" style="background:#16a085;">🛍️ Open Shop (drive the resource-loading signal)</a>
+      <a href="/${uuid}/behavior.json" class="nav-link" style="background:#34495e;">📄 JSON</a>
+      <a href="/${uuid}/behavior" class="nav-link" style="background:#34495e;">🔄 Refresh</a>
+    </div>
+
+    <div class="legend">
+      <div style="margin-bottom:8px;"><strong>How this works:</strong> every request to <code>/${uuid}/*</code> is grouped by client (IP + User-Agent) and scored on six agent-vs-human signals. Each signal returns 0–100 (higher = more agent-like); the aggregate is a weighted average.</div>
+      <div style="font-size:12px;color:#95a5a6;">
+        <strong style="color:#2ecc71;">Signals checked:</strong>
+        Request cadence (CoV) ·
+        Idle / think time ·
+        Parallel requests ·
+        Resource loading (HTML → CSS/JS/images) ·
+        Referer chain continuity ·
+        Session depth
+      </div>
+    </div>
+
+    ${clientsHtml}
+  </div>
+</body>
+</html>`);
+    }
+  );
 });
 
 
